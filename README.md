@@ -15,7 +15,7 @@ To evaluate, example scripts are provided in `eval_scan.sh`
 
 ### Example script (Please update checkpoint path after downloading models):
 ```
-bash eval_any.sh L3_3B_2k_1PC.csv L3_3B_2k_1PC ExpPred meta-llama/Llama-3.2-3B 1024 16 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Llama-3.2-3B_False_llama_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_1_False_False_False_False_4_8_2/0.001_16_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_2048_1024_1_28_4_16_4_MSE_False_False_L3_3B_2k_1PC.csv_L3_3B_2k_1PC_True_0.38571428571428584_20250111-042334.pt"
+bash eval_scan.sh L3_3B_2k_1PC.csv L3_3B_2k_1PC ExpPred meta-llama/Llama-3.2-3B 1024 16 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Llama-3.2-3B_False_llama_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_1_False_False_False_False_4_8_2/0.001_16_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_2048_1024_1_28_4_16_4_MSE_False_False_L3_3B_2k_1PC.csv_L3_3B_2k_1PC_True_0.38571428571428584_20250111-042334.pt"
 ```
 
 ### Modes supported: 
