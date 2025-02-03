@@ -51,7 +51,7 @@ Training requires 1 A6000 GPU for these variants, model parallelism support for 
 
 ![Predictor Architecture](https://github.com/abdelfattah-lab/TokenButler/blob/main/mainfig.png)
 
-# Custom Synethtic Task
+# Custom Synthetic Task
 
 ![Custom Synthetic Task](https://github.com/abdelfattah-lab/TokenButler/blob/main/datasetfig.png)
 
