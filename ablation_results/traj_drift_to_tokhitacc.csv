@@ -1,0 +1,9 @@
+Model,Token Hit-Acc,Trajectory Drift
+meta-llama/Llama-3.2-3B,69.93%,0.391882211
+meta-llama/Llama-2-7b-hf,74.95%,0.4764849544
+meta-llama/Llama-3.1-8B,71.29%,0.4069825113
+mistralai/Mistral-7B-v0.1,72.98%,0.4459896
+microsoft/Phi-3.5-mini-instruct,75.65%,0.4591850042
+microsoft/Phi-3-mini-4k-instruct,75.47%,0.4730259776
+meta-llama/Llama-3.2-1B,73.32%,0.3799426
+Qwen/Qwen2.5-3B,73.13%,0.384742
