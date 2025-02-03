@@ -1,5 +1,8 @@
 # TokenButler: Token Importance Is Predictable
 
+
+![TokenButler Logo](https://github.com/abdelfattah-lab/TokenButler/blob/main/tokenbutlerlogo.png)
+
 This repository contains code to reproduce the experiments in the paper: TokenButler: Token Importance Is Predictable. 
 
 All of our results, traces from experiments are located in `ablation_results/`
@@ -44,6 +47,15 @@ We provide scripts for the following models:
 
 Training requires 1 A6000 GPU for these variants, model parallelism support for larger trainin runs is WIP!
 
+# Predictor Architecture
+
+![Predictor Architecture](https://github.com/abdelfattah-lab/TokenButler/blob/main/mainfig.png)
+
+# Custom Synethtic Task
+
+![Custom Synthetic Task](https://github.com/abdelfattah-lab/TokenButler/blob/main/datasetfig.png)
+
 ## Citation
+
 
 Coming soon!
