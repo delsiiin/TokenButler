@@ -642,6 +642,8 @@ class LlamaAttentionExperimental(nn.Module):
 
             elif evalmode == "quest":
                 if self.layer_idx > 0:
+                    # Look at https://github.com/mit-han-lab/Quest/blob/main/evaluation/quest_attention.py
+                    # Adapted a lot from there.
                     num_tok_per_page = self.num_tok_per_page
                     num_full_pages = q_len // num_tok_per_page
                     if num_full_pages > 0:
