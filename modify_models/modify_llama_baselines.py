@@ -424,119 +424,102 @@ class LlamaAttentionExperimental(nn.Module):
                         attn_weights = attn_weights + extended_mask
                     else:
                         self.snapkv_cache = None
-                        # Flatten [batch, head] for simpler indexing
                         combined_bh = bsz * num_heads                    
                         attn_weights_2d = attn_weights.view(combined_bh, q_len, kv_seq_len)
 
-                        # 2) Build big causal mask once (for the entire seq)
-                        #    shape [q_len, kv_seq_len], or broadcastable to [CBH, q_len, kv_seq_len].
                         if not hasattr(self, "causal_mask") or self.causal_mask.shape[0] != q_len or self.causal_mask.shape[1] != kv_seq_len:
-                            # Build new mask
                             big_mask = torch.full((q_len, kv_seq_len), float('-inf'), device=attn_weights.device)
                             for row in range(q_len):
-                                # Unmask [0..row], mask [row+1.. end]
                                 big_mask[row, :row+1] = 0.0
                             self.causal_mask = big_mask
                         else:
-                            big_mask = self.causal_mask[:q_len, :kv_seq_len]  # slice if larger
+                            big_mask = self.causal_mask[:q_len, :kv_seq_len] 
+                        attn_weights_2d = attn_weights_2d + big_mask.unsqueeze(0) 
+                        attn_weights_2d = F.softmax(attn_weights_2d, dim=-1)      
 
-                        # 3) Apply that mask (broadcast to [CBH, q_len, kv_seq_len]) and do one big softmax
-                        #    This ensures all queries see only valid (non-future) tokens
-                        attn_weights_2d = attn_weights_2d + big_mask.unsqueeze(0)  # shape [CBH, q_len, kv_seq_len]
-                        attn_weights_2d = F.softmax(attn_weights_2d, dim=-1)       # shape [CBH, q_len, kv_seq_len]
-
-                        # 4) Build prefix-sums along the query dimension => shape [CBH, q_len, kv_seq_len]
+                        # Prefix Sum: On query, convert to cumulative sums across queries
+                        # Efficient way of keeping cumulative attention weights instead of recomputing per-window
+                        # Line 11 : vote = attn_weights[..., -window_size:, :-window_size].sum(dim=-2)
                         prefix_sums_2d = attn_weights_2d.cumsum(dim=1)
 
-                        # 5) We'll keep a final_mask for each step i
                         final_mask = torch.full_like(attn_weights, float('-inf'))
                         final_mask_2d = final_mask.view(combined_bh, q_len, kv_seq_len)
 
-                        # 6) Active set arrays
-                        #    We'll choose some initial "max_budget" based on full q_len, or adapt each step.
-                        # max_budget = max(int(q_len * self.sparse_aggression), min_sparse_index)
+                        max_budget = max(int(q_len * self.sparse_aggression), min_sparse_index)
                         # max_budget = min(1024, max(kv_seq_len, min_sparse_index))
-                        max_budget = 1024
+                        # max_budget = 1024
                         active_tokens = torch.full((combined_bh, max_budget), 0, dtype=torch.long, device=attn_weights.device)
                         active_counts = torch.ones(combined_bh, dtype=torch.long, device=attn_weights.device)
 
-                        # 7) For i=0, unmask token 0
                         final_mask_2d[:, 0, 0] = 0.0
-
-                        # 8) Define observation window
                         obs_size = 32
                         
-                        # 9) Main loop
                         for i in range(1, q_len):
-                            # Re-compute the local step budget
-                            # step_budget = max(int((i + 1) * self.sparse_aggression), min_sparse_index)
-                            step_budget = max_budget
-
-                            # Identify obs_start
+                            step_budget = max(int((i + 1) * self.sparse_aggression), min_sparse_index)
+                            # step_budget = max_budget
                             obs_start = max(0, i - obs_size + 1)
                             obs_length = i - obs_start + 1
                             prefix_length = obs_start
 
-                            # 9A) aggregator for each token t in [0.. i] is sum_{q in [obs_start..i]} attn_weights_2d[row, q, t].
-                            #     Using prefix sums, aggregator[row, t] = prefix_sums_2d[row, i, t] - prefix_sums_2d[row, obs_start-1, t].
-                            # We'll write this into a buffer "aggregator"
+                            # Our prefix sum was 'cumulative' over ALL past queries. 
+                            # We'll write this into a buffer "aggregator" that only keeps the prefix sum over the observation window.
                             aggregator = torch.zeros(combined_bh, i + 1, device=attn_weights.device)
-
                             if obs_start > 0:
+                                # To keep only observation window, we need to 'remove' the prefix sum up to obs_start.
                                 aggregator[:, : (i + 1)] = prefix_sums_2d[:, i, : (i + 1)] - prefix_sums_2d[:, obs_start - 1, : (i + 1)]
                             else:
                                 aggregator[:, : (i + 1)] = prefix_sums_2d[:, i, : (i + 1)]
 
-                            # (Optional) apply SnapKV 1D pooling for clustering => aggregator pooling
-                            # Let's do a simple example with avg_pool1d across tokens dimension => [CBH, i+1].
-                            # We'll pool over dimension -1, so we need aggregator => shape [CBH, 1, i+1].
-                            # Then pick from aggregator_pooled. This is just an example--adjust as needed.
-                            kernel_size = 5
-                            aggregator_reshaped = aggregator[:, : (i + 1)].unsqueeze(1)  # [CBH, 1, i+1]
-                            aggregator_pooled = F.avg_pool1d(aggregator_reshaped, kernel_size=kernel_size,
+                            # Line 13: pool_vote = pool1d(vote, kernel_size = kernel_size , padding = kernel_size //2 , stride =1)
+                            kernel_size = 7
+                            aggregator_reshaped = aggregator[:, : (i + 1)].unsqueeze(1)
+                            aggregator_pooled = F.max_pool1d(aggregator_reshaped, kernel_size=kernel_size,
                                                             stride=1, padding=kernel_size // 2)
-                            aggregator_pooled = aggregator_pooled.squeeze(1)  # [CBH, i+1]
+                            aggregator_pooled = aggregator_pooled.squeeze(1)
 
-                            # 9B) aggregator for new token i => aggregator_pooled[row, i]
-                            new_token_importance = aggregator_pooled[:, i].unsqueeze(-1)  # [CBH, 1]
+                            new_token_importance = aggregator_pooled[:, i].unsqueeze(-1)
 
-                            # 9C) Insert or replace in the active set
+                            # We need to track active tokens and track budget for each B*H
                             can_add = active_counts < step_budget
                             add_indices = can_add.nonzero(as_tuple=False).squeeze(-1)
                             active_tokens[add_indices, active_counts[add_indices]] = i
                             active_counts[add_indices] += 1
 
                             cannot_add = ~can_add
+                            # If any heads have exceeded budget, we need to replace tokens
                             if cannot_add.any():
                                 replace_indices = cannot_add.nonzero(as_tuple=False).squeeze(-1)
+                                # get active tokens for budget excess
                                 current_active = active_tokens[replace_indices, :step_budget]
-                                # aggregator for those tokens => aggregator_pooled[row, token]
-                                # gather => shape [?, step_budget]
+                                # Get their pooled importances
                                 row_imps = aggregator_pooled[replace_indices].gather(1, current_active)
-                                # find min
+                                # find least important token
                                 min_vals, min_idxs = torch.min(row_imps, dim=1, keepdim=True)
+                                # replace if new token is more important
                                 new_imps = new_token_importance[replace_indices]
                                 should_replace = new_imps > min_vals
                                 rows_to_replace = replace_indices[should_replace.squeeze(1)]
                                 pos_to_replace = min_idxs[should_replace.squeeze(1)].squeeze(1)
                                 active_tokens[rows_to_replace, pos_to_replace] = i
 
-                            # 9D) Construct final_mask row i
+                            # Initialize mask for that 'query index'
                             final_mask_2d[:, i, :] = float('-inf')
-
                             positions = torch.arange(max_budget, device=attn_weights.device).unsqueeze(0)
                             valid_positions = positions < active_counts.unsqueeze(1)
                             valid_rows = valid_positions.nonzero(as_tuple=True)[0]
                             valid_token_positions = valid_positions.nonzero(as_tuple=True)[1]
+                            # Used 0,1 to get 'bh' and 'token' positions
                             valid_tokens = active_tokens[valid_rows, valid_token_positions]
+                            # Make active tokens unmasked
                             final_mask_2d[valid_rows, i, valid_tokens] = 0.0
-
-                            # Also unmask the obs window
+                            # >>> We dont un-mask the observation window <<<
+                            # Also unmask the obs window 
                             # Only done in wikitext eval, otherwise we shouldn't do this.
                             # too low sparsity in downstream eval
                             # if q_len == 1024:
                             #     final_mask_2d[:, i, obs_start : i + 1] = 0.0
-                        # 10) Reshape final_mask
+                            # >>> We dont un-mask the observation window <<<
+                            
                         final_mask = final_mask_2d.view(bsz, num_heads, q_len, kv_seq_len)
                         final_mask[:, :, :, :min_sparse_index] = 0.0
                         self.snapkv_cache = final_mask[:, :, -1, :].clone().unsqueeze(2)
@@ -548,37 +531,23 @@ class LlamaAttentionExperimental(nn.Module):
                 if self.layer_idx > 0:
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                     bsz, num_heads, q_len, kv_seq_len = attn_weights.size()
-                    # Initialize final mask with -inf
                     final_mask = torch.full_like(attn_weights, float('-inf'))
-                    # Reshape for parallel processing over heads
                     combined_bh = bsz * num_heads
                     final_mask = final_mask.view(combined_bh, q_len, kv_seq_len)
-                    # Determine maximum kv_cache_budget
                     max_budget = max(int(key_len * self.sparse_aggression), min_sparse_index)
                     
-                    # If q_len == 1, this is a decode step (adding one token at a time)
                     if q_len == 1 and h2o_importance_history is not None:
+                        # For discussion, lets skip decode time correctness in interest of time
+                        # So that we can focus on our acccuracy eval result validity
                         max_budget = max(int(key_len * self.sparse_aggression), min_sparse_index)
-                        # Load existing active_tokens and active_counts
                         prev_active_tokens, prev_active_counts = h2o_importance_history
-                        # if prev_active_tokens.size(-1) is smaller than max_budget,
-                        # make it bigger 
                         if prev_active_tokens.size(-1) <= max_budget:
                             prev_active_tokens = torch.cat(
                                 [prev_active_tokens, torch.full_like(prev_active_tokens, 0)], dim=-1
                             )[..., :max_budget + 1]
 
-                        # prev_active_tokens: [combined_bh, max_budget]
-                        # prev_active_counts: [combined_bh]
-
-                        # Let's say total_tokens_so_far = stored_key.size(2) + q_len
                         total_tokens_so_far = kv_seq_len
                         new_token_id = total_tokens_so_far - 1
-
-                        # Current row weights up to new_token_id
-                        # For q_len==1, i=0 is the new token. 
-                        # Since q_len=1 means just one query position, attn_weights shape: [B,H,1,kv_seq_len]
-                        # Let's flatten for easier indexing:
                         attn_weights_2d = attn_weights.view(combined_bh, 1, kv_seq_len)
                         row_weights = attn_weights_2d[:, 0, :new_token_id+1]  # [combined_bh, new_token_id+1]
 
@@ -589,8 +558,6 @@ class LlamaAttentionExperimental(nn.Module):
                         can_add = prev_active_counts < kv_cache_budget
                         add_indices = can_add.nonzero(as_tuple=False).squeeze(-1)
 
-                        # if self.layer_idx == 1:
-                        #     import pdb; pdb.set_trace()
                         prev_active_tokens[add_indices, prev_active_counts[add_indices] - 1] = new_token_id
                         prev_active_counts[add_indices] += 1
 
@@ -607,8 +574,6 @@ class LlamaAttentionExperimental(nn.Module):
                             pos_to_replace = min_idxs[should_replace.squeeze(1)].squeeze(1)
                             prev_active_tokens[rows_to_replace, pos_to_replace] = new_token_id
 
-
-                        # Construct final_mask for this single step
                         final_mask = torch.full_like(attn_weights, float('-inf'))
                         final_mask = final_mask.view(combined_bh, 1, kv_seq_len)
                         valid_positions = torch.arange(max_budget, device=attn_weights.device).unsqueeze(0) < prev_active_counts.unsqueeze(1)
@@ -621,7 +586,6 @@ class LlamaAttentionExperimental(nn.Module):
                         self.final_mask_investigate = final_mask
                         attn_weights = attn_weights + final_mask
 
-                        # Update h2o_importance_history with the latest active_tokens and counts
                         h2o_importance_history = (prev_active_tokens, prev_active_counts)
 
                     else:
@@ -668,6 +632,7 @@ class LlamaAttentionExperimental(nn.Module):
 
                         final_mask = final_mask_2d.view(bsz, num_heads, q_len, kv_seq_len)
                         # Here, mask_tensor should need mask_tensor[:, :, :, :min_sparse_index] = 0.0 (?) verify
+                        final_mask[:, :, :, :min_sparse_index] = 0.0
                         self.final_mask_investigate = final_mask
                         attn_weights = attn_weights + final_mask
                         # After processing full q_len (prefill), store active_tokens and active_counts into h2o_importance_history
