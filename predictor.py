@@ -70,7 +70,7 @@ class TokenImportancePredictorAttentive(nn.Module):
         self.num_heads = num_heads
         self.num_hidden_layers = num_hidden_layers
         self.dropout = dropout
-        self.head_dim = pred_hid_size // (num_heads * 4)
+        self.head_dim = pred_hid_size // (num_heads * 4) # Predictor head dimension is not the same as the model head dimension.
         self.rope_theta = config.rope_theta
         self.dDash = dDash
         self.intermediate_dim = intdim
@@ -122,6 +122,7 @@ class TokenImportancePredictorAttentive(nn.Module):
         # Initialize rotary positional embeddings
         self._init_rope()
         self._initialize_weights()
+        self.device = None
 
     def _initialize_weights(self):
         for name, module in self.named_modules():
@@ -144,17 +145,20 @@ class TokenImportancePredictorAttentive(nn.Module):
                     nn.init.constant_(module.out_proj.bias, 0)
 
     def _init_rope(self):
+
+        # send self.config but after modifying head_dim to be self.head_dim just in the function call
+        config_copy = copy.deepcopy(self.config)
+        config_copy.head_dim = self.attn_head_dim
+
         # Rotary embedding for attention layer
         self.rotary_emb_attn = LlamaRotaryEmbedding(
-            self.attn_head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
+            config_copy
         )
+
+        config_copy.head_dim = self.dDash
         # Rotary embedding for importance projection
         self.rotary_emb_importance = LlamaRotaryEmbedding(
-            self.dDash,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
+            config_copy
         )
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, use_cache=False):
@@ -171,6 +175,11 @@ class TokenImportancePredictorAttentive(nn.Module):
         Returns:
             torch.Tensor: Importance scores of shape [B, N, H, L, L].
         """
+        # Set device if not already set
+        if self.device != hidden_states.device:
+            self.device = hidden_states.device
+            self.to(self.device)
+            
         B, L, E = hidden_states.size()
         if past_key_value is None:
             past_key_value = {}
@@ -198,7 +207,7 @@ class TokenImportancePredictorAttentive(nn.Module):
         cos, sin = self.rotary_emb_attn(v, position_ids)
         
         if position_ids is None:
-            position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=hidden_states.device)
+            position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=self.device)
             position_ids = position_ids.unsqueeze(0).expand(B, kv_seq_len)
         
         if past_primary is not None:
@@ -330,6 +339,7 @@ class HeadImportancePredictor(nn.Module):
         # Initialize rotary positional embeddings
         self._init_rope()
         self._initialize_weights()
+        self.device = None
 
     def _initialize_weights(self):
         for name, module in self.named_modules():
@@ -354,15 +364,11 @@ class HeadImportancePredictor(nn.Module):
     def _init_rope(self):
         # Rotary embedding for attention layer
         self.rotary_emb_attn = LlamaRotaryEmbedding(
-            self.attn_head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
+            self.config
         )
         # Rotary embedding for importance projection
         self.rotary_emb_importance = LlamaRotaryEmbedding(
-            self.dDash,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
+            self.config
         )
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, use_cache=False):
@@ -379,6 +385,11 @@ class HeadImportancePredictor(nn.Module):
         Returns:
             torch.Tensor: Importance scores of shape [B, N, H, L, L].
         """
+        # Set device if not already set
+        if self.device != hidden_states.device:
+            self.device = hidden_states.device
+            self.to(self.device)
+
         B, L, E = hidden_states.size()
         if past_key_value is None:
             past_key_value = {}
@@ -406,7 +417,7 @@ class HeadImportancePredictor(nn.Module):
         cos, sin = self.rotary_emb_attn(v, position_ids)
         
         if position_ids is None:
-            position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=hidden_states.device)
+            position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=self.device)
             position_ids = position_ids.unsqueeze(0).expand(B, kv_seq_len)
         
         if past_primary is not None:

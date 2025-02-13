@@ -2,6 +2,7 @@ import json
 import tqdm
 import torch
 from torch import nn
+from predictor import PredictorDynamicCache
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, LlamaForCausalLM, AutoConfig
 from datasets import load_dataset
 from functools import partial
@@ -263,12 +264,34 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
         preds.append({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj.get("all_classes", None), "length": json_obj.get("length", None)})
     return preds
 
+
 def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_list=["arc_easy", "hellaswag"], limit=None, flash_attn=False, train_headpredictor=False):
+
     for module in model.modules():
         # Here, we should take care to set head predictor flash attention mode appropriately
         module.flash_attn = False
     model.seqlen = max_length
     lm_obj = HFLM(pretrained=model, tokenizer=tokenizer, add_bos_token=False, batch_size=batch_size)
+
+
+    # Get the original forward method
+    original_forward = lm_obj.model.forward
+
+    # Define a patched forward method
+    def patched_forward(*args, **kwargs):
+        # Extract past_key_values from kwargs (if provided)
+        past_key_values = kwargs.get("past_key_values", None)
+        
+        # Replace with your custom class
+        if past_key_values is not None:
+            kwargs["past_key_values"] = PredictorDynamicCache()
+        
+        # Call the original forward method
+        return original_forward(*args, **kwargs)
+
+    # Apply the patch
+    lm_obj.model.forward = patched_forward
+
     task_manager = lm_eval.tasks.TaskManager()
     print(f"Evaluating on tasks: {task_list}")
     # autocast
@@ -279,7 +302,7 @@ def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_l
                 tasks=task_list,
                 task_manager=task_manager,
                 log_samples=False,
-                limit=limit
+                limit=limit,
             )
     res = make_table(results)
     print(res)
