@@ -38,7 +38,7 @@ class PredictorDynamicCache(DynamicCache):
         key_states, value_states = super().update(key_states, value_states, layer_idx)
         return key_states, value_states
 
-    def update_predictors(self, predictor_cache, head_predictor_cache):
+    def update_predictors(self, predictor_cache, head_predictor_cache=None):
         self.predictor_cache = predictor_cache
         self.head_predictor_cache = head_predictor_cache
 
@@ -194,6 +194,7 @@ class TokenImportancePredictorAttentive(nn.Module):
         #     import pdb; pdb.set_trace()
         past_primary = past_key_value.get('primary', None)
         # Reduce hidden size
+        hidden_states = hidden_states.to(self.input_proj.weight.dtype)
         hidden_states_reduced = self.input_proj(hidden_states)  # [B, L, hidden_size_reduced]
         # Compute q, k, v for attention
         q = self.q_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]
@@ -234,9 +235,6 @@ class TokenImportancePredictorAttentive(nn.Module):
             attn_output = attention(q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16), True, sm_scale).to(q.dtype)
         else:
             attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
-        # # attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
-        # sm_scale = 1.0 / math.sqrt(self.attn_head_dim)
-        # attn_output = attention(q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16), True, sm_scale).to(q.dtype)
         attn_output = attn_output.to(q.dtype)
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced)
         attn_output = self.norm1(attn_output)
@@ -267,7 +265,6 @@ class TokenImportancePredictorAttentive(nn.Module):
         # Concatenate past keys and values if cache is present
         if past_importance is not None:
             k_importance = torch.cat([past_importance['k'], k_importance], dim=1)  # [BNH, past_L + L, D']
-
         kv_seq_len = k_importance.size(1)
 
         # Apply rotary positional embeddings
@@ -404,6 +401,7 @@ class HeadImportancePredictor(nn.Module):
         #     import pdb; pdb.set_trace()
         past_primary = past_key_value.get('primary', None)
         # Reduce hidden size
+        hidden_states = hidden_states.to(self.input_proj.weight.dtype)
         hidden_states_reduced = self.input_proj(hidden_states)  # [B, L, hidden_size_reduced]
         # Compute q, k, v for attention
         q = self.q_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]

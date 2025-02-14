@@ -228,7 +228,6 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
         prompt = prompt_format.format(**json_obj)
         # Truncate to fit max_length
         tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-        
         if len(tokenized_prompt) > max_length:
             half = int(max_length / 2)
             prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) + tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
@@ -239,10 +238,11 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
         
         input_ids = tokenizer(prompt, truncation=False, return_tensors="pt")
         context_length = input_ids.input_ids.shape[-1]
+        embed_device = model.model.embed_tokens.weight.device
         with autocast():
             if dataset == "samsum":
                 output = model.generate(
-                    **input_ids.to(device),
+                    **input_ids.to(embed_device),
                     max_new_tokens=max_gen,
                     num_beams=1,
                     do_sample=False,
@@ -252,7 +252,7 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
                 )[0].to("cpu")
             else:
                 output = model.generate(
-                    **input_ids.to(device),
+                    **input_ids.to(embed_device),
                     max_new_tokens=max_gen,
                     num_beams=1,
                     do_sample=False,
@@ -477,6 +477,13 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     Returns:
         The fine-tuned model.
     """
+    if args.model_parallelism:
+        model_producer_layers = get_producer_layers(model)
+        for producer_layer in model_producer_layers:
+            for param in producer_layer.sparse_token_predictor.parameters():
+                param = param.to('cuda:0')
+        for name, param in model.named_parameters():
+            print(f"Layer: {name}, Device: {param.device}")
     max_seq_len = args.rpj_train_seqlen
     batch_size = 1  # Adjust based on your GPU memory
 
@@ -686,8 +693,8 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                     if module.__class__.__name__.endswith("AttentionExperimental"):
                         if hasattr(module, 'msemagn_loss'):
                             nlayers += 1
-                            mse_match_loss += module.msemagn_loss
-                            head_match_loss += module.headmsemagn_loss
+                            mse_match_loss += module.msemagn_loss.to('cuda:0')
+                            head_match_loss += module.headmsemagn_loss.to('cuda:0')
                             module.msemagn_loss = 0
                             module.headmsemagn_loss = 0
                             if calc_hitrates:
@@ -932,21 +939,27 @@ if __name__ == '__main__':
     config = AutoConfig.from_pretrained(model_path, use_auth_token=True, trust_remote_code=True)
     if args.model_parallelism:
         from transformers import AutoConfig
-        # from accelerate import init_empty_weights, dispatch_model, infer_auto_device_map
-        # offload_dir = tempfile.TemporaryDirectory()
-        # with init_empty_weights():
-        #     model = AutoModelForCausalLM.from_config(config)
-        # device_map = infer_auto_device_map(
-        #     model,
-        #     max_memory={i: "15GB" for i in range(torch.cuda.device_count())},
-        #     no_split_module_classes=["LlamaDecoderLayer"]
-        # )
         device_cnt = torch.cuda.device_count()
-        device_map = {"model.embed_tokens": 0, "model.rotary_emb": 0, "model.norm": device_cnt - 1, "lm_head": device_cnt - 1}
-        device_num_layers = config.num_hidden_layers // device_cnt
-        for i in range(config.num_hidden_layers):
-            device_map[f"model.layers.{i}"] = i // device_num_layers
-        print(f"Device map: {device_map}")
+        if device_cnt <= 2:
+            extra_param_device = device_cnt - 1
+            device_map = {"model.embed_tokens": extra_param_device, "model.rotary_emb": extra_param_device, "model.norm": extra_param_device, "lm_head": extra_param_device}
+            device_num_layers = config.num_hidden_layers // device_cnt
+            for i in range(config.num_hidden_layers):
+                device_map[f"model.layers.{i}"] = i // device_num_layers 
+        else:
+            extra_param_device = 0
+            device_map = {"model.embed_tokens": extra_param_device, "model.rotary_emb": extra_param_device, "model.norm": extra_param_device, "lm_head": extra_param_device}
+            # # strategy for llama2
+            # device_num_layers = config.num_hidden_layers // (device_cnt - 1)
+            # for i in range(config.num_hidden_layers):
+            #     device_map[f"model.layers.{i}"] = (i // device_num_layers + 1) % device_cnt
+            # device_map[f'model.layers.{0}'] = 0
+
+            # strategy for llama3
+            device_num_layers = config.num_hidden_layers // (device_cnt - 1)
+            for i in range(config.num_hidden_layers):
+                device_map[f"model.layers.{i}"] = (i // device_num_layers + 1) % device_cnt
+            device_map[f'model.layers.{0}'] = 0
         dtype = torch.float16 if args.model_mode == "eval" else torch.float32
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -956,6 +969,7 @@ if __name__ == '__main__':
             use_auth_token=True,
             torch_dtype=dtype,
         )
+        # model.model.embed_tokens = model.model.embed_tokens.to('cuda:0')
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path, offload_folder=None, trust_remote_code=True, use_auth_token=True, **kwargs).cuda()
     if args.randomize_init:
@@ -1081,6 +1095,8 @@ if __name__ == '__main__':
         wandb.log({
             "avg_token_sparsity": avg_token_sparsity
         })
+    if not args.model_parallelism:
+        model = model.cuda()
     try:
         producer_layer = get_producer_layers(model)[0]
 
@@ -1137,15 +1153,15 @@ if __name__ == '__main__':
             for idx, producer_layer_weight in enumerate(producer_layer_weights):
                 try:
                     model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
+                    if args.model_parallelism:
+                        model_producer_layers[idx].to("cuda:0")
                 except Exception as e:
                     print(f"Error loading producer layer {idx}: {e}")
                     print("\n\nContinuing... !! Bad Perf If Unintentional !!\n\n")
-
             
         set_inference_mode(model, True)
 
         model.eval()
-
         torch.cuda.empty_cache()
         gc.collect()
         perplexity = 0

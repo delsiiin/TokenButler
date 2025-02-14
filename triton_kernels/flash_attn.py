@@ -68,8 +68,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 # re-tuning.
 configs = [
     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
-    for BM in [16, 32]\
-    for BN in [16]\
+    for BM in [16, 32, 64, 128]\
+    for BN in [16, 32]\
     for s in ([1] if is_hip() else [3, 4, 7])\
     for w in [4, 8]\
 ]

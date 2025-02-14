@@ -97,16 +97,16 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_imp,  #
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
 # the code below and commenting out the equivalent parameters is convenient for
 # re-tuning.
-configs = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
-    for BM in [32]\
-    for BN in [32]\
-    for s in ([1] if is_hip() else [3, 4, 7])\
-    for w in [4, 8]\
-]
+# configs = [
+#     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+#     for BM in [32]\
+#     for BN in [32]\
+#     for s in ([1] if is_hip() else [3, 4, 7])\
+#     for w in [4, 8]\
+# ]
 
 fixed_config = triton.Config(
-    {'BLOCK_M': 32, 'BLOCK_N': 32},
+    {'BLOCK_M': 16, 'BLOCK_N': 16},
     num_stages=4,
     num_warps=8
 )
