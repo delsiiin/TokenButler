@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb, Phi3Config, Phi3Attention, Phi3RotaryEmbedding, Phi3LongRoPEScaledRotaryEmbedding
+from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb, Phi3Config, Phi3Attention, Phi3RotaryEmbedding
 
 from utils import repeat_kv, sorted_index_to_mask
 from utils import calculate_hit_metrics
@@ -81,18 +81,9 @@ class Phi3AttentionExperimental(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
-        if self.rope_scaling is None:
-            self.rotary_emb = Phi3RotaryEmbedding(
-                self.head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=self.rope_theta,
-            )
-        else:
-            scaling_type = self.config.rope_scaling["type"]
-            if scaling_type == "longrope":
-                self.rotary_emb = Phi3LongRoPEScaledRotaryEmbedding(self.head_dim, self.config)
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+        self.rotary_emb = Phi3RotaryEmbedding(
+            config=self.config
+        )
 
     def update_predictor(self):
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
@@ -155,15 +146,9 @@ class Phi3AttentionExperimental(nn.Module):
         use_cache: bool = False,
         padding_mask: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[PredictorDynamicCache]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len, _ = hidden_states.size()
         Ltrack = hidden_states.size(1)
-
-        # Convert DynamicCache to PredictorDynamicCache if needed
-        if past_key_value is not None and not isinstance(past_key_value, PredictorDynamicCache):
-            if isinstance(past_key_value, DynamicCache):
-                assert past_key_value.get_seq_length() == 0, "If past_key_value is DynamicCache, then it must be empty"
-            past_key_value = PredictorDynamicCache()
 
         if q_len != 1:  # this is prefill stage for first token output, reset q-k importance tensors
             self.q_importance = None

@@ -131,9 +131,7 @@ class LlamaAttentionExperimental(nn.Module):
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=self.rope_theta,
+                config=self.config
             )
         else:
             scaling_type = self.config.rope_scaling.get("type") or self.config.rope_scaling.get("rope_type")
@@ -144,6 +142,7 @@ class LlamaAttentionExperimental(nn.Module):
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
                     base=self.rope_theta,
+                    config=self.config
                 )
             elif scaling_type == "dynamic":
                 self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
@@ -151,6 +150,7 @@ class LlamaAttentionExperimental(nn.Module):
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
                     base=self.rope_theta,
+                    config=self.config
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
