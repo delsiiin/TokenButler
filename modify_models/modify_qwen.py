@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, Qwen2Config, Qwen2SdpaAttention, Qwen2RotaryEmbedding
+from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, Qwen2Config, Qwen2Attention, Qwen2RotaryEmbedding
 
 from utils import repeat_kv, sorted_index_to_mask
 from utils import calculate_hit_metrics
@@ -139,15 +139,9 @@ class Qwen2AttentionExperimental(nn.Module):
         padding_mask: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[PredictorDynamicCache]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len, _ = hidden_states.size()
         Ltrack = hidden_states.size(1)
-
-        # Convert DynamicCache to PredictorDynamicCache if needed
-        if past_key_value is not None and not isinstance(past_key_value, PredictorDynamicCache):
-            if isinstance(past_key_value, DynamicCache):
-                assert past_key_value.get_seq_length() == 0, "If past_key_value is DynamicCache, then it must be empty"
-            past_key_value = PredictorDynamicCache()
 
         if q_len != 1:  # this is prefill stage for first token output, reset q-k importance tensors
             self.q_importance = None
@@ -360,7 +354,7 @@ class Qwen2AttentionExperimental(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
 def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
     producer_layer = None
@@ -371,7 +365,7 @@ def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=
         for name, module in parent_module._modules.items():
             if len(list(module.children())) > 0:
                 recurse_convert(module)
-            if isinstance(module, Qwen2SdpaAttention):
+            if isinstance(module, Qwen2Attention):
                 device = next(module.parameters()).device
                 dtype = next(module.parameters()).dtype
                 if layer_counter['idx'] % producer_frequency == 0:

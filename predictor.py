@@ -148,6 +148,13 @@ class TokenImportancePredictorAttentive(nn.Module):
 
         # send self.config but after modifying head_dim to be self.head_dim just in the function call
         config_copy = copy.deepcopy(self.config)
+        config_copy.rope_scaling = {
+            "factor": 32.0,
+            "high_freq_factor": 4.0,
+            "low_freq_factor": 1.0,
+            "original_max_position_embeddings": 8192,
+            "rope_type": "llama3"
+        }
         config_copy.head_dim = self.attn_head_dim
 
         # Rotary embedding for attention layer

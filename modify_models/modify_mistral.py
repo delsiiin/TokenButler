@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb, MistralConfig, MistralSdpaAttention
+from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb, MistralConfig, MistralAttention, MistralRotaryEmbedding
 
 from utils import repeat_kv, sorted_index_to_mask
 from utils import calculate_hit_metrics
@@ -25,34 +25,6 @@ from predictor import TokenImportancePredictorAttentive, PredictorDynamicCache, 
 
 from triton_kernels.flash_attn import attention
 from triton_kernels.flash_attn_mse_loss import attention_mse_loss
-
-class MistralRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
-        super().__init__()
-
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    @torch.no_grad()
-    # copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding.forward
-    # TODO(joao): add me back asap :)
-    def forward(self, x, position_ids):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
-        # Force float32 since bfloat16 loses precision on long contexts
-        # See https://github.com/huggingface/transformers/pull/29285
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class MistralAttentionExperimental(nn.Module):
@@ -102,11 +74,7 @@ class MistralAttentionExperimental(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         
-        self.rotary_emb = MistralRotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
-        )
+        self.rotary_emb = MistralRotaryEmbedding(config)
         
     def update_predictor(self):
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
@@ -162,6 +130,7 @@ class MistralAttentionExperimental(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Union[DynamicCache, PredictorDynamicCache]] = None,
@@ -169,15 +138,9 @@ class MistralAttentionExperimental(nn.Module):
         use_cache: bool = False,
         padding_mask: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[PredictorDynamicCache]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len, _ = hidden_states.size()
         Ltrack = hidden_states.size(1)
-
-        # Convert DynamicCache to PredictorDynamicCache if needed
-        if past_key_value is not None and not isinstance(past_key_value, PredictorDynamicCache):
-            if isinstance(past_key_value, DynamicCache):
-                assert past_key_value.get_seq_length() == 0, "If past_key_value is DynamicCache, then it must be empty"
-            past_key_value = PredictorDynamicCache()
 
         if q_len != 1:  # this is prefill stage for first token output, reset q-k importance tensors
             self.q_importance = None
@@ -194,13 +157,14 @@ class MistralAttentionExperimental(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
+
         evalmode = self.eval_llm_mode
         num_tokens_to_keep = int(q_len * self.sparse_aggression)
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
         if use_cache:
@@ -387,7 +351,7 @@ class MistralAttentionExperimental(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
 def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
     producer_layer = None
@@ -398,7 +362,7 @@ def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=
         for name, module in parent_module._modules.items():
             if len(list(module.children())) > 0:
                 recurse_convert(module)
-            if isinstance(module, MistralSdpaAttention):
+            if isinstance(module, MistralAttention):
                 device = next(module.parameters()).device
                 dtype = next(module.parameters()).dtype
                 if layer_counter['idx'] % producer_frequency == 0:
