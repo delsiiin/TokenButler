@@ -452,10 +452,10 @@ class LlamaAttentionExperimental(nn.Module):
                         active_counts = torch.ones(combined_bh, dtype=torch.long, device=attn_weights.device)
 
                         final_mask_2d[:, 0, 0] = 0.0
-                        obs_size = 32
+                        obs_size = 16
                         
                         for i in range(1, q_len):
-                            step_budget = max(int((i + 1) * self.sparse_aggression), min_sparse_index)
+                            step_budget = max(int((i + 1 - obs_size) * self.sparse_aggression), min_sparse_index)
                             # step_budget = max_budget
                             obs_start = max(0, i - obs_size + 1)
                             obs_length = i - obs_start + 1
@@ -471,7 +471,7 @@ class LlamaAttentionExperimental(nn.Module):
                                 aggregator[:, : (i + 1)] = prefix_sums_2d[:, i, : (i + 1)]
 
                             # Line 13: pool_vote = pool1d(vote, kernel_size = kernel_size , padding = kernel_size //2 , stride =1)
-                            kernel_size = 7
+                            kernel_size = 5
                             aggregator_reshaped = aggregator[:, : (i + 1)].unsqueeze(1)
                             aggregator_pooled = F.max_pool1d(aggregator_reshaped, kernel_size=kernel_size,
                                                             stride=1, padding=kernel_size // 2)
@@ -512,6 +512,9 @@ class LlamaAttentionExperimental(nn.Module):
                             valid_tokens = active_tokens[valid_rows, valid_token_positions]
                             # Make active tokens unmasked
                             final_mask_2d[valid_rows, i, valid_tokens] = 0.0
+                            # >>> WE UNMASK THE OBSERVATION WINDOW <<<
+                            final_mask_2d[:, i, obs_start : i + 1] = 0.0
+                            # >>> WE UNMASK THE OBSERVATION WINDOW <<<
                             # >>> We dont un-mask the observation window <<<
                             # Also unmask the obs window 
                             # Only done in wikitext eval, otherwise we shouldn't do this.
@@ -757,7 +760,7 @@ class LlamaAttentionExperimental(nn.Module):
             attn_weights = None
 
         
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
 def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
     producer_layer = None

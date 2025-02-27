@@ -734,7 +734,7 @@ class Phi3AttentionExperimental(nn.Module):
         #     gc.collect()
         #     torch.cuda.empty_cache()
         
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
 def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
     producer_layer = None

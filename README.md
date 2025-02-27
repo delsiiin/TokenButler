@@ -8,6 +8,14 @@ This repository contains code to reproduce the experiments in the paper: TokenBu
 All of our results, traces from experiments are located in `ablation_results/`
 
 
+## Installation
+
+`conda create --name TokenButler python=3.10`
+
+`conda activate TokenButler`
+
+`python -m pip install -r requirements.txt`
+
 ## Evaluation
 Please download our trained TokenButler predictor models from `To Be Added`
 

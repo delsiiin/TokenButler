@@ -788,11 +788,11 @@ if __name__ == '__main__':
             if args.ssmize_predictor:
                 raise NotImplementedError("SSMize deprecated for ExpPred. Ref to commit 053db60eaafac33611e86110f6110d8c8e4afe25 for implementation.")
             else:
-                from modify_llama import convert_kvcache_experimental, convert_llama_channel_config_experimental
-                from modify_llama import LlamaAttentionExperimental
+                from modify_models.modify_llama import convert_kvcache_experimental, convert_llama_channel_config_experimental
+                from modify_models.modify_llama import LlamaAttentionExperimental
         else:
-            from modify_llama_baselines import convert_kvcache_experimental, convert_llama_channel_config_experimental
-            from modify_llama_baselines import LlamaAttentionExperimental
+            from modify_models.modify_llama_baselines import convert_kvcache_experimental, convert_llama_channel_config_experimental
+            from modify_models.modify_llama_baselines import LlamaAttentionExperimental
 
         model = convert_kvcache_experimental(model, config, args.producer_frequency, args.heavy_const, args.group_factor, args.q_bits)
         if channel_config is not None:
@@ -801,15 +801,15 @@ if __name__ == '__main__':
     elif args.architecture == "mistral":
         print("Running Mistral module replacement")
         if args.eval_llm_mode == "ExpPred":
-            from modify_mistral import convert_kvcache_experimental
+            from modify_models.modify_mistral import convert_kvcache_experimental
         else:
-            from modify_mistral_baselines import convert_kvcache_experimental
+            from modify_models.modify_mistral_baselines import convert_kvcache_experimental
 
         model = convert_kvcache_experimental(model, config, args.producer_frequency, args.heavy_const, args.group_factor, args.q_bits)
     elif args.architecture == "mixtral":
         print("Running Mixtral module replacement")
         if args.eval_llm_mode == "ExpPred":
-            from modify_mixtral import convert_kvcache_experimental
+            from modify_models.modify_mixtral import convert_kvcache_experimental
         else:
             raise NotImplementedError("Baseline modes not implemented for Mixtral yet")
 
@@ -817,15 +817,15 @@ if __name__ == '__main__':
     elif args.architecture == "phi3":
         print("Running Phi3 module replacement")
         if args.eval_llm_mode == "ExpPred":
-            from modify_phi3 import convert_kvcache_experimental
+            from modify_models.modify_phi3 import convert_kvcache_experimental
         else:
-            from modify_phi3_baselines import convert_kvcache_experimental
+            from modify_models.modify_phi3_baselines import convert_kvcache_experimental
 
         model = convert_kvcache_experimental(model, config, args.producer_frequency, args.heavy_const, args.group_factor, args.q_bits)
     elif args.architecture == "glm":
         print("Running GLM module replacement")
         if args.eval_llm_mode == "ExpPred":
-            from modify_glm import convert_kvcache_experimental
+            from modify_models.modify_glm import convert_kvcache_experimental
         else:
             raise NotImplementedError("Baseline modes not implemented for GLM yet")
 
@@ -833,7 +833,7 @@ if __name__ == '__main__':
     elif args.architecture == "qwen":
         print("Running Qwen module replacement")
         if args.eval_llm_mode == "ExpPred":
-            from modify_qwen import convert_kvcache_experimental
+            from modify_models.modify_qwen import convert_kvcache_experimental
         else:
             raise NotImplementedError("Baseline modes not implemented for Qwen yet")
     
