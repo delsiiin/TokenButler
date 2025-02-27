@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb, Phi3Config, Phi3Attention, Phi3RotaryEmbedding, Phi3LongRoPEScaledRotaryEmbedding
+from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb, Phi3Config, Phi3Attention, Phi3RotaryEmbedding
 
 from utils import repeat_kv, sorted_index_to_mask
 from utils import calculate_hit_metrics
@@ -96,18 +96,9 @@ class Phi3AttentionExperimental(nn.Module):
         self._init_rope()
         
     def _init_rope(self):
-        if self.rope_scaling is None:
-            self.rotary_emb = Phi3RotaryEmbedding(
-                self.head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=self.rope_theta,
-            )
-        else:
-            scaling_type = self.config.rope_scaling["type"]
-            if scaling_type == "longrope":
-                self.rotary_emb = Phi3LongRoPEScaledRotaryEmbedding(self.head_dim, self.config)
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+        self.rotary_emb = Phi3RotaryEmbedding(
+            config=self.config
+        )
 
 
     def update_predictor(self):
@@ -729,7 +720,7 @@ class Phi3AttentionExperimental(nn.Module):
         #     gc.collect()
         #     torch.cuda.empty_cache()
         
-        return attn_output, attn_weights
+        return attn_output, attn_weights, past_key_value
 
 def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
     producer_layer = None
