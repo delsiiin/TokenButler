@@ -174,12 +174,6 @@ class LlamaAttentionExperimental(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         Ltrack = hidden_states.size(1)
 
-        # Convert DynamicCache to PredictorDynamicCache if needed
-        if past_key_value is not None and not isinstance(past_key_value, PredictorDynamicCache):
-            if isinstance(past_key_value, DynamicCache):
-                assert past_key_value.get_seq_length() == 0, "If past_key_value is DynamicCache, then it must be empty"
-            past_key_value = PredictorDynamicCache()
-
         if q_len != 1:  # this is prefill stage for first token output, reset q-k importance tensors
             self.q_importance = None
             self.k_importance = None
@@ -377,7 +371,7 @@ class LlamaAttentionExperimental(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
 def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
     producer_layer = None

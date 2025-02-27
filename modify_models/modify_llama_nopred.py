@@ -260,7 +260,7 @@ class LlamaAttentionExperimental(nn.Module):
 
         #     self.q_importance = q_importance
         #     self.k_importance = k_importance
-        return attn_output, None, None
+        return attn_output, None
 
 def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
     producer_layer = None

@@ -148,11 +148,6 @@ class MistralAttentionExperimental(nn.Module):
         # convert hidden_states to same dtype as self.q_proj.weight
         # hidden_states = hidden_states.to(self.q_proj.weight.dtype)
 
-        if past_key_value is not None and not isinstance(past_key_value, BaselineDynamicCache):
-            if isinstance(past_key_value, DynamicCache):
-                assert past_key_value.get_seq_length() == 0, "If past_key_value is DynamicCache, then it must be empty"
-            past_key_value = BaselineDynamicCache()
-
         if q_len != 1: # this is prefill stage for first token output, reset self.token_mask
                        # further, this should guarantee that token_mask is always assigned, as its always prefill first.
             self.token_mask = None
