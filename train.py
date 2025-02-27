@@ -279,13 +279,8 @@ def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_l
 
     # Define a patched forward method
     def patched_forward(*args, **kwargs):
-        # Extract past_key_values from kwargs (if provided)
-        past_key_values = kwargs.get("past_key_values", None)
-        
-        # Replace with your custom class
-        if past_key_values is not None:
-            kwargs["past_key_values"] = PredictorDynamicCache()
-        
+        kwargs["past_key_values"] = PredictorDynamicCache()
+
         # Call the original forward method
         return original_forward(*args, **kwargs)
 
