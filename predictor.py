@@ -32,6 +32,7 @@ class PredictorDynamicCache(DynamicCache):
         super().__init__()
         self.predictor_cache = None
         self.head_predictor_cache = None  # Add this for Head Importance Predictor
+        self.h2o_importance = None
     
     def update(self, key_states, value_states, layer_idx):
         # First update the base cache
@@ -47,6 +48,12 @@ class PredictorDynamicCache(DynamicCache):
     
     def get_head_predictor_cache(self):
         return self.head_predictor_cache
+    
+    def update_h2o_importance(self, h2o_importance):
+        self.h2o_importance = h2o_importance
+    
+    def get_h2o_importance(self):
+        return self.h2o_importance
 
 
 class TokenImportancePredictorAttentive(nn.Module):
