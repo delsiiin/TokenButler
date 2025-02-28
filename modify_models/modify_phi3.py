@@ -17,7 +17,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb, Phi3Config, Phi3Attention, Phi3RotaryEmbedding
 
-from utils import repeat_kv, sorted_index_to_mask, SlidingWindowCache, enforce_sliding_window
+from utils import repeat_kv, sorted_index_to_mask, SlidingWindowCache, enforce_sliding_window, threshold_to_mask
 from utils import calculate_hit_metrics
 from transformers.cache_utils import DynamicCache
 from predictor import TokenImportancePredictorAttentive, PredictorDynamicCache, HeadImportancePredictor, attention_mse_loss, attention
