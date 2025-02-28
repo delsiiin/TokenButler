@@ -848,6 +848,7 @@ if __name__ == '__main__':
     # Current focus 
     parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
     # Current focus 
+    parser.add_argument('--sliding_window', type=int, default=None, help='Sliding window at eval IF comparing to SnapKV, set it to 16: Very Important!!!!!')
     parser.add_argument('--randomize_init', action='store_true', help='Very Experimental! Tries to train predictor on RANDOMLY initialized transformer...')
     parser.add_argument('--test_with_thresholds', action='store_true', help='Test With Per-Head Token Thresholding, must have calibrated before!')
     parser.add_argument('--gfac', type=int, default=1)
@@ -904,6 +905,8 @@ if __name__ == '__main__':
     np.random.seed(args.seed)
     random.seed(args.seed)
     os.environ["PYTHONHASHSEED"] = str(args.seed)
+
+    print("IF EVALUATING: To compare with SnapKV Fairly, please set --sliding_window to 16 for experiments.")
 
 
     if dowandb:
@@ -1073,6 +1076,7 @@ if __name__ == '__main__':
             module.train_headpredictor = args.train_headpredictor
             module.min_sparse_index = args.min_sparse_index
             module.num_layers_pred = module.producer_frequency  # Literally the gap is the number of layers to predict for.
+            module.sliding_window = args.sliding_window
 
             if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
                 if module.layer_idx % args.producer_frequency == 0:
