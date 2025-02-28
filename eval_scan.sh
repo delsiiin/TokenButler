@@ -82,7 +82,7 @@ dDash=$6
 model_load_path=$7
 # Hardcoded values
 task_list="winogrande,hellaswag,piqa,arc_easy"
-eval_subset=2500
+eval_subset=100
 
 
 # Loop over token sparse methods

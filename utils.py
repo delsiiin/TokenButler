@@ -405,7 +405,7 @@ def calculate_hit_metrics(estimated_importance: torch.Tensor,
 
     return hit_accuracy, mean_corr, max_corr
 
-def plot_thresholds(threshold_tensor, true_threshold_tensor):
+def plot_thresholds(threshold_tensor, true_threshold_tensor, fpath_base, fpath_specific):
     """
     Plots mean and error regions for random layers and heads, showing threshold changes across decode steps.
     
@@ -418,8 +418,8 @@ def plot_thresholds(threshold_tensor, true_threshold_tensor):
         Helper function to generate the plot.
         """
         # Choose 3 random layers
-        # layers = np.random.choice(tensor.shape[1], 3, replace=False)
-        layers = np.array([0, 15, 30])
+        layers = np.random.choice(tensor.shape[1], 3, replace=False)
+        # layers = np.array([0, 15, 30])
         
         # Create subplots
         fig, axs = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
@@ -430,16 +430,19 @@ def plot_thresholds(threshold_tensor, true_threshold_tensor):
             heads = np.random.choice(tensor.shape[2], 5, replace=False)
             
             for head in heads:
-                # Extract data for the selected layer and head
-                data = tensor[:, layer, head, :].numpy()  # Shape [163, 1024]
-                
-                # Compute mean and standard deviation across samples (dim=0)
-                mean = np.mean(data, axis=0)
-                std = np.std(data, axis=0)
-                
-                # Plot mean and shaded error region for the head
-                axs[i].plot(x, mean, label=f"Head {head}")
-                axs[i].fill_between(x, mean - std, mean + std, alpha=0.3)
+                try:
+                    # Extract data for the selected layer and head
+                    data = tensor[:, layer, head, :].numpy()  # Shape [163, 1024]
+                    
+                    # Compute mean and standard deviation across samples (dim=0)
+                    mean = np.mean(data, axis=0)
+                    std = np.std(data, axis=0)
+                    
+                    # Plot mean and shaded error region for the head
+                    axs[i].plot(x, mean, label=f"Head {head}")
+                    axs[i].fill_between(x, mean - std, mean + std, alpha=0.3)
+                except:
+                    import pdb; pdb.set_trace()
             
             # Customize subplot
             axs[i].set_title(f"Layer {layer}")
@@ -468,11 +471,16 @@ def plot_thresholds(threshold_tensor, true_threshold_tensor):
         
         return mean_threshold
 
+    # create folder fpath_base if it does not exist
+    if not os.path.exists(f"threshold_plots"):
+        os.makedirs(f"threshold_plots")
+    if not os.path.exists(f"threshold_plots/{fpath_base}"):
+        os.makedirs(f"threshold_plots/{fpath_base}")
     # Plot for threshold_tensor
-    create_plot(threshold_tensor, "Post-Attention Thresholds", "postattn_threshold.pdf")
+    create_plot(threshold_tensor, "Post-Attention Thresholds", f"threshold_plots/{fpath_base}/{fpath_specific}_postattn_threshold.pdf")
     
     # Plot for true_threshold_tensor
-    create_plot(true_threshold_tensor, "Predicted Pre-SM Thresholds", "pred_presm_threshold.pdf")
+    create_plot(true_threshold_tensor, "Predicted Pre-SM Thresholds", f"threshold_plots/{fpath_base}/{fpath_specific}_pred_presm_threshold.pdf")
 
     # Compute mean thresholds
     mean_threshold_postattn = compute_mean_threshold(threshold_tensor)

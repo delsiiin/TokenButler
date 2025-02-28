@@ -104,7 +104,7 @@ class Phi3AttentionExperimental(nn.Module):
                 intdim = 16, attn_reduce_factor=(self.pred_hid_size // self.num_heads)
             )
             # Dont use flash-attention if head-prediction is in pseudo mdoe.
-            self.sparse_head_predictor.flash_attn = False
+            # self.sparse_head_predictor.flash_attn = False
 
     def set_head_sparsity(self, head_sparsity_aggression, global_prune):
         self.head_sparsity_aggression = head_sparsity_aggression
@@ -218,10 +218,27 @@ class Phi3AttentionExperimental(nn.Module):
                                 true_importance=attn_weights,
                                 top_k_ratio=0.5
                             )
-                        importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
-                        sorted_indices = torch.argsort(importance_mask, dim=-1, descending=True)
-                        sorted_indices = sorted_indices[:, :, -q_len:, :]
-                        mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
+                        if self.calibrate_thresholds:
+                            ### Threshold variance investigation
+                            unadj_importance_mask = importance_mask.clone()
+                            importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
+                            sorted_indices = torch.argsort(importance_mask, dim=-1, descending=True)
+                            sorted_indices = sorted_indices[:, :, -q_len:, :]
+                            sorted_values, sorted_ix = torch.sort(importance_mask, dim=-1)
+                            sorted_true_values, _ = torch.sort(torch.gather(unadj_importance_mask, dim=-1, index=sorted_ix), dim=-1)
+                            true_thresholds = sorted_true_values[:, :, :, int(importance_mask.size(-1) * self.sparse_aggression)]
+                            thresholds = sorted_values[:, :, :, int(importance_mask.size(-1) * self.sparse_aggression)]
+                            self.true_threshmean = true_thresholds
+                            self.threshmean = thresholds
+                        if self.test_with_thresholds:
+                            unadj_importance_mask = importance_mask.clone()
+                            perhead_thresholds = self.tok_calibration_set[self.layer_idx - 1].to(unadj_importance_mask.device) # 0 does not have calibration data.
+                            mask_tensor = threshold_to_mask(unadj_importance_mask, perhead_thresholds, min_sparse_index, bsz, q_len, key_len)
+                        else:
+                            importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
+                            sorted_indices = torch.argsort(importance_mask, dim=-1, descending=True)
+                            sorted_indices = sorted_indices[:, :, -q_len:, :]
+                            mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
                         if self.sliding_window is not None:
                             if not hasattr(self, "window_cache"):
                                 self.window_cache = SlidingWindowCache(max_seq_len=1024,
@@ -297,17 +314,22 @@ class Phi3AttentionExperimental(nn.Module):
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
                 attn_output = torch.matmul(attn_weights, value_states)
 
-            if self.layer_idx > 0:
-                head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency].float()
-                attn_head_weights = attn_output.mean(dim=-1).permute(0, 2, 1)
-                self.headmsemagn_loss = self.headmseloss(attn_head_weights, head_importance_tensor).mean()
+        if self.layer_idx > 0 and self.train_headpredictor:
+            head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency].float()
+            attn_head_weights = attn_output.mean(dim=-1).permute(0, 2, 1)
+            self.headmsemagn_loss = self.headmseloss(attn_head_weights, head_importance_tensor).mean()
 
-                if self.calc_hitrates:
-                    self.head_hit_acc, self.head_mean_rank_corr, self.head_max_rank_corr = calculate_hit_metrics(
-                        estimated_importance=head_importance_tensor,
-                        true_importance=attn_head_weights,
-                        top_k_ratio=0.5
-                    )
+            if self.calc_hitrates:
+                self.head_hit_acc, self.head_mean_rank_corr, self.head_max_rank_corr = calculate_hit_metrics(
+                    estimated_importance=head_importance_tensor,
+                    true_importance=attn_head_weights,
+                    top_k_ratio=0.5
+                )
+        else:
+            self.headmsemagn_loss = 0
+            if self.calc_hitrates:
+                self.head_hit_acc, self.head_mean_rank_corr, self.head_max_rank_corr = 0, 0, 0
+
             
         if final_mask is not None:
             if self.effective_sparsity is None:
@@ -338,14 +360,15 @@ class Phi3AttentionExperimental(nn.Module):
                     past_key_value=past_key_value_sp, 
                     use_cache=use_cache
                 )
-                head_importances, past_key_value_hp = self.sparse_head_predictor(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value_hp,
-                    use_cache=use_cache
-                )
-                head_importances = head_importances.view(bsz, q_len, self.num_heads, self.num_hidden_layers) # [B L H N]
+                if self.train_headpredictor:
+                    head_importances, past_key_value_hp = self.sparse_head_predictor(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value_hp,
+                        use_cache=use_cache
+                    )
+                    head_importances = head_importances.view(bsz, q_len, self.num_heads, self.num_hidden_layers) # [B L H N]
                 q_len = attn_output.size(1)
                 k_len = k_importance.size(-1)
             except:
@@ -355,10 +378,11 @@ class Phi3AttentionExperimental(nn.Module):
             self.q_importance = q_importance
             self.k_importance = k_importance
 
-            if self.head_importances is None:
-                self.head_importances = head_importances
-            else:
-                self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
+            if self.train_headpredictor:
+                if self.head_importances is None:
+                    self.head_importances = head_importances
+                else:
+                    self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
 
 
         if use_cache:
