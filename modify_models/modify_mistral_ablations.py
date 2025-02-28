@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb, MistralConfig, MistralSdpaAttention
+from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb, MistralConfig, MistralAttention
 
 from utils import repeat_kv, sorted_index_to_mask
 from utils import calculate_hit_metrics
@@ -320,7 +320,7 @@ def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=
         for name, module in parent_module._modules.items():
             if len(list(module.children())) > 0:
                 recurse_convert(module)
-            if isinstance(module, MistralSdpaAttention):
+            if isinstance(module, MistralAttention):
                 device = next(module.parameters()).device
                 dtype = next(module.parameters()).dtype
                 if layer_counter['idx'] % producer_frequency == 0:
