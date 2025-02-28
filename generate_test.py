@@ -430,8 +430,17 @@ def investigate_custom_sentences(model, tokenizer, args, testenc=None, traintime
 
         fm_bool = [x.bool().cpu() for x in fm]
         batch_idx = 0
+        import pdb; pdb.set_trace()
         num_heads = fm_bool[0].shape[1]
+        currmask = fm_bool[0][0][0]
+        # make sns heatmap and save it
+        plt.figure(figsize=(9, 3))
+        sns.heatmap(currmask.cpu().numpy(), cmap=sns.color_palette("light:b", as_cmap=True), cbar=False, xticklabels=False, yticklabels=False)
+        plt.axis('off')  # Remove axes
+        plt.tight_layout(pad=0)  # Maximize heatmap
+        plt.savefig(f"mask2_{args.eval_llm_mode}.png", bbox_inches='tight', pad_inches=0)
 
+        import pdb; pdb.set_trace()
         head_preservation_info = {}
         for head_idx in range(num_heads):
             tok_pres_counts = []

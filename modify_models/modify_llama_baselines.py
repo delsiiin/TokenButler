@@ -218,6 +218,7 @@ class LlamaAttentionExperimental(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         if past_key_value is not None:
+#            import pdb; pdb.set_trace()
             h2o_importance_history = past_key_value.get_h2o_importance()
         else:
             h2o_importance_history = None
@@ -451,6 +452,7 @@ class LlamaAttentionExperimental(nn.Module):
                         
                         for i in range(1, q_len):
                             step_budget = max(int((i + 1 - obs_size) * self.sparse_aggression), min_sparse_index)
+                            # step_budget = max(int((i + 1) * self.sparse_aggression), min_sparse_index)
                             # step_budget = max_budget
                             obs_start = max(0, i - obs_size + 1)
                             obs_length = i - obs_start + 1
@@ -520,6 +522,7 @@ class LlamaAttentionExperimental(nn.Module):
                             
                         final_mask = final_mask_2d.view(bsz, num_heads, q_len, kv_seq_len)
                         final_mask[:, :, :, :min_sparse_index] = 0.0
+                        self.final_mask_investigate = final_mask
                         self.snapkv_cache = final_mask[:, :, -1, :].clone().unsqueeze(2)
                         attn_weights = attn_weights + final_mask
                 else:
