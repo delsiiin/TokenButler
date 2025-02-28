@@ -61,7 +61,6 @@ class LlamaAttentionExperimental(nn.Module):
         self.train_headpredictor = False
         self.calibrate_thresholds = False
         self.test_with_thresholds = False
-        self.tok_calibration_set = threshold_model_dictionary.get(config._name_or_path, None)
 
         if self.layer_idx > 0:
             self.mseloss = MSELoss(reduction='none')
@@ -110,6 +109,11 @@ class LlamaAttentionExperimental(nn.Module):
 
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
+        if self.token_sparse_method is not None:
+            mname = self.config._name_or_path.split("/")[-1]
+            read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
+            threshold_model_dictionary = torch.load(read_path)
+            self.tok_calibration_set = threshold_model_dictionary
         if self.token_sparse_method == "LazyLLM":
             if self.layer_idx <= 9:
                 self.sparse_aggression = 1
