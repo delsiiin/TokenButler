@@ -17,7 +17,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb, MistralConfig, MistralAttention, MistralRotaryEmbedding
 
-from utils import repeat_kv, sorted_index_to_mask
+from utils import repeat_kv, sorted_index_to_mask, SlidingWindowCache, enforce_sliding_window
 from utils import calculate_hit_metrics
 from transformers.cache_utils import DynamicCache
 
@@ -231,6 +231,13 @@ class MistralAttentionExperimental(nn.Module):
                         _, sorted_indices = importance_mask.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
                         sorted_indices = sorted_indices[:, :, -q_len:, :]
                         mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                    sliding_window=self.sliding_window,
+                                                                    device=mask_tensor.device)
+                            window = self.window_cache.get_window(q_len, key_len)
+                            mask_tensor = enforce_sliding_window(mask_tensor, window)
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                         final_mask = mask_tensor
                         attn_wt_shape = attn_weights.shape
@@ -270,71 +277,6 @@ class MistralAttentionExperimental(nn.Module):
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                     final_mask = mask_tensor
                     attn_weights = attn_weights + mask_tensor + attention_mask
-                else:
-                    attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            elif evalmode == "snapkv_old":
-                if self.layer_idx > 0:
-                    attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-                    bsz, num_heads, q_len, kv_seq_len = attn_weights.size()
-                    combined_bh = bsz * num_heads
-                    attn_weights_2d = attn_weights.view(combined_bh, q_len, kv_seq_len)
-                    obs_size = 16
-                    final_mask = torch.full_like(attn_weights, float('-inf'))
-                    final_mask_2d = final_mask.view(combined_bh, q_len, kv_seq_len)
-                    # ---------------------------------------------------------------------
-                    # Build one big causal_mask for entire seq_len x seq_len:
-                    #    causal_mask[i, j] = 0 if j <= i, else -inf
-                    # ---------------------------------------------------------------------
-                    if hasattr(self, 'causal_mask'):
-                        causal_mask = self.causal_mask
-                    else:
-                        causal_mask = torch.full((q_len, q_len), float('-inf'), device=attn_weights.device)
-                        for r in range(q_len):
-                            causal_mask[r, : r + 1] = 0.0  # lower-tri (including diagonal) = 0
-                        self.causal_mask = causal_mask
-
-
-                    for i in range(1, q_len):
-                        max_budget = max(int((i+1) * self.sparse_aggression), min_sparse_index)
-                        # Reset this row to -inf each iteration, so we only keep fresh selections
-                        final_mask_2d[:, i, :] = float('-inf')
-
-                        obs_start = max(0, i - obs_size + 1)
-                        obs_length = i - obs_start + 1
-                        prefix_length = obs_start  # everything before the observation window
-
-                        if prefix_length > 0:
-                            # Sum attention from obs window to prefix
-                            attn_slice = attn_weights_2d[:, obs_start:(i+1), 0:obs_start]  # shape [CBH, obs_length, prefix_length]
-                            temp_mask = causal_mask[obs_start : i + 1, : prefix_length]  # [obs_length, prefix_length]
-                            attn_slice = attn_slice + temp_mask.unsqueeze(0)  # shape [CBH, obs_length, prefix_length]
-                            attn_slice = F.softmax(attn_slice, dim=-1)
-                            attn_agg = attn_slice.sum(dim=1)  # [CBH, prefix_length]
-
-                            # Optional pooling
-                            kernel_size = 5
-                            pooled = F.avg_pool1d(
-                                attn_agg.unsqueeze(1),
-                                kernel_size=kernel_size,
-                                padding=kernel_size // 2,
-                                stride=1
-                            ).squeeze(1)  # shape [CBH, prefix_length]
-
-                            # Decide how many prefix tokens to keep
-                            num_prefix_to_keep = max_budget - obs_length
-                            num_prefix_to_keep = min(max(num_prefix_to_keep, 0), prefix_length)
-
-                            if num_prefix_to_keep > 0:
-                                topk_indices = pooled.topk(num_prefix_to_keep, dim=1).indices
-                                # Unmask those top prefix positions
-                                row_idx = torch.arange(combined_bh, device=attn_weights.device).unsqueeze(-1)
-                                final_mask_2d[row_idx, i, topk_indices] = 0.0
-                        final_mask_2d[:, i, obs_start:(i+1)] = 0.0
-                        # Important code snippet to ensure consistency.
-# for numel in [1, 16, 32, 64, 128, 256, 512, 768, 966, 968, 1000, 1020, 1023]: print("Seq-idx: ", numel, "Sparsity: ", 100*(1 - torch.logical_not(final_mask[0, 0, numel].bool()).sum()/(numel + 1)).item(), "%")
-                    final_mask = final_mask_2d.view(bsz, num_heads, q_len, kv_seq_len)
-                    final_mask[:, :, :, :min_sparse_index] = 0.0
-                    attn_weights = attn_weights + final_mask
                 else:
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
             elif evalmode == "snapkv":
@@ -541,6 +483,13 @@ class MistralAttentionExperimental(nn.Module):
                         valid_tokens = prev_active_tokens[valid_rows, valid_token_positions]
                         final_mask[valid_rows, 0, valid_tokens] = 0.0
                         final_mask = final_mask.view(bsz, num_heads, 1, kv_seq_len)
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                    sliding_window=self.sliding_window,
+                                                                    device=final_mask.device)
+                            window = self.window_cache.get_window(q_len, key_len)
+                            final_mask = enforce_sliding_window(final_mask, window)
 
                         attn_weights = attn_weights + final_mask
 
@@ -590,6 +539,13 @@ class MistralAttentionExperimental(nn.Module):
                             final_mask_2d[valid_rows, i, valid_tokens] = 0.0
 
                         final_mask = final_mask_2d.view(bsz, num_heads, q_len, kv_seq_len)
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                    sliding_window=self.sliding_window,
+                                                                    device=final_mask.device)
+                            window = self.window_cache.get_window(q_len, key_len)
+                            final_mask = enforce_sliding_window(final_mask, window)
                         attn_weights = attn_weights + final_mask
                         # After processing full q_len (prefill), store active_tokens and active_counts into h2o_importance_history
                         h2o_importance_history = (active_tokens, active_counts)
@@ -643,6 +599,13 @@ class MistralAttentionExperimental(nn.Module):
 
                     sorted_indices = sorted_indices[:, :, -q_len:, :]
                     mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                    if self.sliding_window is not None:
+                        if not hasattr(self, "window_cache"):
+                            self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                sliding_window=self.sliding_window,
+                                                                device=mask_tensor.device)
+                        window = self.window_cache.get_window(q_len, key_len)
+                        mask_tensor = enforce_sliding_window(mask_tensor, window)
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                     final_mask = mask_tensor
                     attn_weights = attn_weights + mask_tensor + attention_mask

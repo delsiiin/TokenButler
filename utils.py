@@ -32,6 +32,38 @@ import matplotlib.cm as cm
 from scipy.spatial.distance import cosine
 from tqdm import tqdm
 
+class SlidingWindowCache:
+    def __init__(self, max_seq_len, sliding_window, device):
+        self.sliding_window = sliding_window
+        self.device = device
+        if sliding_window is None:
+            self.max_seq_len = 0
+            self.window = None
+        else:
+            self.max_seq_len = max_seq_len
+            self.window = self._create_window(self.max_seq_len)
+
+    def _create_window(self, seq_len):
+        idx = torch.arange(seq_len, device=self.device)
+        query = idx.unsqueeze(1)  # [seq_len, 1]
+        key = idx.unsqueeze(0)    # [1, seq_len]
+        win = (key >= (query - self.sliding_window + 1)) & (key <= query)
+        return win.unsqueeze(0).unsqueeze(0)  # [1,1,seq_len,seq_len]
+
+    def get_window(self, q_len, key_len):
+        if self.sliding_window is None:
+            return None
+        req = max(q_len, key_len)
+        if req > self.max_seq_len:
+            self.max_seq_len = req
+            self.window = self._create_window(self.max_seq_len)
+        return self.window[:, :, :q_len, :key_len]
+
+def enforce_sliding_window(mask_tensor, window):
+    if window is None:
+        return mask_tensor
+    return mask_tensor.masked_fill(window, 0.0)
+
 
 def sanitize_filename(name):
     return re.sub(r'[<>:"/\\|?*\'\[\]]', '_', name)

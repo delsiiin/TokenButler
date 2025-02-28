@@ -430,7 +430,6 @@ def investigate_custom_sentences(model, tokenizer, args, testenc=None, traintime
 
         fm_bool = [x.bool().cpu() for x in fm]
         batch_idx = 0
-        import pdb; pdb.set_trace()
         num_heads = fm_bool[0].shape[1]
         currmask = fm_bool[0][0][0]
         # make sns heatmap and save it
@@ -439,6 +438,7 @@ def investigate_custom_sentences(model, tokenizer, args, testenc=None, traintime
         plt.axis('off')  # Remove axes
         plt.tight_layout(pad=0)  # Maximize heatmap
         plt.savefig(f"mask2_{args.eval_llm_mode}.png", bbox_inches='tight', pad_inches=0)
+        exit(0)
 
         import pdb; pdb.set_trace()
         head_preservation_info = {}
@@ -654,6 +654,7 @@ if __name__ == '__main__':
     # Current focus 
     parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
     # Current focus 
+    parser.add_argument('--sliding_window', type=int, default=None, help='Sliding window at eval IF comparing to SnapKV, set it to 16: Very Important!!!!!')
     parser.add_argument('--randomize_init', action='store_true', help='Very Experimental! Tries to train predictor on RANDOMLY initialized transformer...')
     parser.add_argument('--test_with_thresholds', action='store_true', help='Test With Per-Head Token Thresholding, must have calibrated before!')
     parser.add_argument('--gfac', type=int, default=1)
@@ -872,6 +873,7 @@ if __name__ == '__main__':
             module.train_headpredictor = args.train_headpredictor
             module.min_sparse_index = args.min_sparse_index
             module.num_layers_pred = module.producer_frequency  # Literally the gap is the number of layers to predict for.
+            module.sliding_window = args.sliding_window
 
             if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
                 if module.layer_idx % args.producer_frequency == 0:

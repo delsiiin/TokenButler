@@ -907,7 +907,9 @@ if __name__ == '__main__':
     os.environ["PYTHONHASHSEED"] = str(args.seed)
 
     print("IF EVALUATING: To compare with SnapKV Fairly, please set --sliding_window to 16 for experiments.")
-
+    # if args.sliding_window is not None:
+    #     print("\n", "*"*50)
+    #     print("SLIDING WINDOW ONLY APPLIES TO BASELINE EVALUATIONS -- I.E., ONLY WHEN _baselines.py VARIANT IS IMPORTED.")
 
     if dowandb:
         if args.wname is not None:

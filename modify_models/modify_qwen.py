@@ -17,7 +17,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, Qwen2Config, Qwen2Attention, Qwen2RotaryEmbedding
 
-from utils import repeat_kv, sorted_index_to_mask
+from utils import repeat_kv, sorted_index_to_mask, SlidingWindowCache, enforce_sliding_window
 from utils import calculate_hit_metrics
 from transformers.cache_utils import DynamicCache
 from predictor import TokenImportancePredictorAttentive, PredictorDynamicCache, HeadImportancePredictor, attention_mse_loss, attention
@@ -215,6 +215,13 @@ class Qwen2AttentionExperimental(nn.Module):
                         sorted_indices = torch.argsort(importance_mask, dim=-1, descending=True)
                         sorted_indices = sorted_indices[:, :, -q_len:, :]
                         mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                    sliding_window=self.sliding_window,
+                                                                    device=mask_tensor.device)
+                            window = self.window_cache.get_window(q_len, key_len)
+                            mask_tensor = enforce_sliding_window(mask_tensor, window)
                         final_mask = mask_tensor
                         attn_weights = attn_weights + mask_tensor + attention_mask
                     else:

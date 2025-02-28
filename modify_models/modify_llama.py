@@ -19,7 +19,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaAttention, apply_rotary_pos_emb
 
 from utils import LlamaLinearScalingRotaryEmbedding, LlamaDynamicNTKScalingRotaryEmbedding, repeat_kv, sorted_index_to_mask
-from utils import calculate_hit_metrics, calculate_effective_sparsity, threshold_to_mask
+from utils import calculate_hit_metrics, calculate_effective_sparsity, threshold_to_mask, SlidingWindowCache, enforce_sliding_window
 from transformers.cache_utils import DynamicCache
 from predictor import TokenImportancePredictorAttentive, PredictorDynamicCache, HeadImportancePredictor, attention_mse_loss, attention
 from threshold_calib_dict import *
@@ -282,6 +282,13 @@ class LlamaAttentionExperimental(nn.Module):
                             sorted_indices = sorted_indices[:, :, -q_len:, :]
                             mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
                         ### Threshold variance investigation
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                    sliding_window=self.sliding_window,
+                                                                    device=mask_tensor.device)
+                            window = self.window_cache.get_window(q_len, key_len)
+                            mask_tensor = enforce_sliding_window(mask_tensor, window)
                         final_mask = mask_tensor
 
                         self.final_mask_investigate = final_mask

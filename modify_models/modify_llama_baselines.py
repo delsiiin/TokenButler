@@ -19,7 +19,8 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaAttention, apply_rotary_pos_emb
 
 from utils import LlamaLinearScalingRotaryEmbedding, LlamaDynamicNTKScalingRotaryEmbedding, repeat_kv, sorted_index_to_mask
-from utils import snapkv_mask_only
+from utils import snapkv_mask_only, SlidingWindowCache, enforce_sliding_window
+# from utils import
 from transformers.cache_utils import DynamicCache
 
 class BaselineDynamicCache(DynamicCache):
@@ -286,6 +287,14 @@ class LlamaAttentionExperimental(nn.Module):
 
                         sorted_indices = sorted_indices[:, :, -q_len:, :]
                         mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                    sliding_window=self.sliding_window,
+                                                                    device=mask_tensor.device)
+                            window = self.window_cache.get_window(q_len, key_len)
+                            mask_tensor = enforce_sliding_window(mask_tensor, window)
+                        # import pdb; pdb.set_trace()
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                         final_mask = mask_tensor
                         self.final_mask_investigate = final_mask
@@ -310,6 +319,13 @@ class LlamaAttentionExperimental(nn.Module):
                     sorted_indices = ll_six.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_heads, key_len, key_len).to(query_states.device)
                     sorted_indices = sorted_indices[:, :, -q_len:, :]
                     mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                    if self.sliding_window is not None:
+                        if not hasattr(self, "window_cache"):
+                            self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                sliding_window=self.sliding_window,
+                                                                device=mask_tensor.device)
+                        window = self.window_cache.get_window(q_len, key_len)
+                        mask_tensor = enforce_sliding_window(mask_tensor, window)
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                     final_mask = mask_tensor
                     attn_weights = attn_weights + mask_tensor + attention_mask
@@ -329,71 +345,6 @@ class LlamaAttentionExperimental(nn.Module):
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                     final_mask = mask_tensor
                     attn_weights = attn_weights + mask_tensor + attention_mask
-                else:
-                    attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            elif evalmode == "snapkv_prefill_wrong":
-                # Here, we fix a capacity and test a non-simulation snapkv to match our numbers with the original implementation.
-                self.window_size = 32
-                self.pooling = "maxpool"
-                self.kernel_size = 7
-                # self.max_capacity_prompt = max(int(key_len * self.sparse_aggression), min_sparse_index) # Set this based on kv_seq_len during prefill
-                self.max_capacity_prompt = 1024
-                # max_budget = max(int(key_len * self.sparse_aggression), min_sparse_index)
-                if not hasattr(self, "snapkv_cache"):
-                    self.snapkv_cache = None
-                
-                if self.layer_idx > 0:
-                    attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-                    head_dim = self.head_dim
-                    bsz, num_heads, q_len, kv_seq_len = attn_weights.size()
-                    if q_len == 1:
-                        # ============================
-                        # 1) Single-token decode step
-                        # ============================
-                        # We have stored a single-step mask from the last bigger prefill step. 
-                        # Merge it into the current attention of shape [bsz, num_heads, 1, kv_seq_len].
-                        if self.snapkv_cache is not None:
-                            # self.snapkv_cache: shape [bsz, num_heads, 1, old_len] or [bsz, num_heads, 1, kv_seq_len]
-                            # We'll fill an extended_mask to shape [bsz, num_heads, 1, kv_seq_len].
-                            new_kv_len = kv_seq_len
-                            extended_mask = torch.full(
-                                (bsz, num_heads, 1, new_kv_len),
-                                float('-inf'),
-                                device=attn_weights.device,
-                                dtype=attn_weights.dtype
-                            )
-                            cached_len = self.snapkv_cache.size(-1)
-                            # Copy the old mask into the front portion
-                            limit = min(new_kv_len, cached_len)
-                            extended_mask[:, :, 0, :limit] = self.snapkv_cache[:, :, 0, :limit]
-                            # any newly appended positions beyond 'limit' can be unmasked or remain -inf, depending on your logic
-                            # if limit < new_kv_len:
-                            extended_mask[:, :, 0, limit:] = 0.0
-
-                            # Merge into current attention
-                            attn_weights = attn_weights + extended_mask
-                        else:
-                            # If no cached mask, do nothing special
-                            pass
-                    else:
-                        self.snapkv_cache = None
-                        # Build the single-step mask from the entire prefix
-                        new_mask = snapkv_mask_only(self, query_states, key_states, value_states)
-                        # store it for usage in the next decode step
-                        if new_mask is not None:
-                            self.snapkv_cache = new_mask
-                        # Merge it into attn_weights for this prefill step as well
-                        # We typically do: shape => [bsz, heads, q_len, kv_seq_len]
-                        # But new_mask is shape [bsz, heads, 1, kv_seq_len]
-                        # so we expand along dimension 2 to match q_len
-                        if new_mask is not None:
-                            # repeated or broadcast
-                            repeated_mask = new_mask.expand(bsz, num_heads, q_len, new_mask.size(-1))
-                            # attn_weights = attn_weights + repeated_mask
-                            attn_weights[:, :, -1, :] += repeated_mask[:, :, -1, :]
-                            if self.layer_idx == 2:
-                                print("Shape: ", repeated_mask.size(), "\tnumel: ", repeated_mask[0, 0, -1, :].bool().int().sum())
-                                print("Effective Sparsity: ", repeated_mask[0, 0, -1, :].bool().int().sum()/repeated_mask.size(-1))
                 else:
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
             elif evalmode == "snapkv":
@@ -451,7 +402,9 @@ class LlamaAttentionExperimental(nn.Module):
                         obs_size = 16
                         
                         for i in range(1, q_len):
-                            step_budget = max(int((i + 1 - obs_size) * self.sparse_aggression), min_sparse_index)
+                            # step_budget = max(int((i + 1 - obs_size) * self.sparse_aggression), min_sparse_index)
+                            # Here, sparsity target is 'ADDITIONAL' to sliding window.
+                            step_budget = max(int((i + 1) * self.sparse_aggression), min_sparse_index)
                             # step_budget = max(int((i + 1) * self.sparse_aggression), min_sparse_index)
                             # step_budget = max_budget
                             obs_start = max(0, i - obs_size + 1)
@@ -512,13 +465,6 @@ class LlamaAttentionExperimental(nn.Module):
                             # >>> WE UNMASK THE OBSERVATION WINDOW <<<
                             final_mask_2d[:, i, obs_start : i + 1] = 0.0
                             # >>> WE UNMASK THE OBSERVATION WINDOW <<<
-                            # >>> We dont un-mask the observation window <<<
-                            # Also unmask the obs window 
-                            # Only done in wikitext eval, otherwise we shouldn't do this.
-                            # too low sparsity in downstream eval
-                            # if q_len == 1024:
-                            #     final_mask_2d[:, i, obs_start : i + 1] = 0.0
-                            # >>> We dont un-mask the observation window <<<
                             
                         final_mask = final_mask_2d.view(bsz, num_heads, q_len, kv_seq_len)
                         final_mask[:, :, :, :min_sparse_index] = 0.0
@@ -583,6 +529,13 @@ class LlamaAttentionExperimental(nn.Module):
                         valid_tokens = prev_active_tokens[valid_rows, valid_token_positions]
                         final_mask[valid_rows, 0, valid_tokens] = 0.0
                         final_mask = final_mask.view(bsz, num_heads, 1, kv_seq_len)
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                    sliding_window=self.sliding_window,
+                                                                    device=final_mask.device)
+                            window = self.window_cache.get_window(q_len, key_len)
+                            final_mask = enforce_sliding_window(final_mask, window)
 
                         self.final_mask_investigate = final_mask
                         attn_weights = attn_weights + final_mask
@@ -590,8 +543,6 @@ class LlamaAttentionExperimental(nn.Module):
                         h2o_importance_history = (prev_active_tokens, prev_active_counts)
 
                     else:
-                        # This is the prefill scenario: we process the entire q_len at once.
-                        # We'll run the original logic to figure out active_tokens for all steps.
                         final_mask = torch.full_like(attn_weights, float('-inf'))
                         final_mask_2d = final_mask.view(combined_bh, q_len, kv_seq_len)
                         attn_weights_2d = attn_weights.view(combined_bh, q_len, kv_seq_len)
@@ -632,8 +583,14 @@ class LlamaAttentionExperimental(nn.Module):
                             final_mask_2d[valid_rows, i, valid_tokens] = 0.0
 
                         final_mask = final_mask_2d.view(bsz, num_heads, q_len, kv_seq_len)
-                        # Here, mask_tensor should need mask_tensor[:, :, :, :min_sparse_index] = 0.0 (?) verify
                         final_mask[:, :, :, :min_sparse_index] = 0.0
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                    sliding_window=self.sliding_window,
+                                                                    device=final_mask.device)
+                            window = self.window_cache.get_window(q_len, key_len)
+                            final_mask = enforce_sliding_window(final_mask, window)
                         self.final_mask_investigate = final_mask
                         attn_weights = attn_weights + final_mask
                         # After processing full q_len (prefill), store active_tokens and active_counts into h2o_importance_history
@@ -692,6 +649,13 @@ class LlamaAttentionExperimental(nn.Module):
                     mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                     final_mask = mask_tensor
+                    if self.sliding_window is not None:
+                        if not hasattr(self, "window_cache"):
+                            self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                sliding_window=self.sliding_window,
+                                                                device=final_mask.device)
+                        window = self.window_cache.get_window(q_len, key_len)
+                        final_mask = enforce_sliding_window(final_mask, window)
 
                     self.final_mask_investigate = final_mask
                     attn_weights = attn_weights + mask_tensor + attention_mask
