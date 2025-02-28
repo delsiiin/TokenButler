@@ -1,15 +1,6 @@
 #!/bin/bash
 
 
-# bash eval_scan.sh L3_1B_2k_snapkv.csv L3_1B_2k_snapkv snapkv meta-llama/Llama-3.2-1B 1024 32 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Llama-3.2-1B_False_llama_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_1_False_False_False_False_4_8_2/0.001_32_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_2048_1024_1_16_4_16_4_MSE_False_False_L3_1B_2k.csv_L3_1B_2k_True_0.37500000000000006_20250110-062915.pt"
-# bash eval_scan.sh L3_1B_2k_1PC_snapkv.csv L3_1B_2k_1PC_snapkv snapkv meta-llama/Llama-3.2-1B 512 16 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Llama-3.2-1B_False_llama_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_1_False_False_False_False_4_8_2/0.001_16_None_False_1000_20_512_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_2048_1024_1_16_4_16_4_MSE_False_False_L3_1B_2k_1PC.csv_L3_1B_2k_1PC_True_0.37500000000000006_20250110-194451.pt"
-# bash eval_scan.sh L3_3B_2k_1PC_snapkv.csv L3_3B_2k_1PC_snapkv snapkv meta-llama/Llama-3.2-3B 1024 16 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Llama-3.2-3B_False_llama_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_1_False_False_False_False_4_8_2/0.001_16_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_2048_1024_1_28_4_16_4_MSE_False_False_L3_3B_2k_1PC.csv_L3_3B_2k_1PC_True_0.38571428571428584_20250111-042334.pt"
-# bash eval_scan.sh L3_8B_1k_snapkv.csv L3_8B_1k_snapkv snapkv meta-llama/Llama-3.1-8B 1024 32 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Llama-3.1-8B_False_llama_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_1_False_False_False_False_4_8_2/0.001_32_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_1024_1024_1_32_4_16_4_MSE_False_False_L3_8B_1k.csv_L3_8B_1k_True_0.3875000000000002_20250111-092627.pt"
-# bash eval_scan.sh L2_7B_2k_snapkv.csv L2_7B_2k_snapkv snapkv meta-llama/Llama-2-7b-hf 1024 32 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Llama-2-7b-hf_False_llama_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_1_False_False_True_False_4_8_2/0.001_32_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_2048_1024_1_32_4_16_4_MSE_False_False_L2_7B_2k.csv_L2_7B_2k_True_0.3875000000000002_20250111-043324.pt"
-# bash eval_scan.sh M7B_1k_snapkv.csv M7B_1k_snapkv snapkv mistralai/Mistral-7B-v0.1 1024 32 "/home/ya255/projects/all_contextual/expt_model/42_mistralai_Mistral-7B-v0.1_False_mistral_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_False_1_False_False_False_False_4_8_2/0.001_32_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_1024_1024_1_32_4_16_4_MSE_False_False_M7B_1k.csv_M7B_1k_True_0.3875000000000002_20250112-104027.pt"
-# bash eval_scan.sh P35mini_1k_1PC_snapkv.csv P35mini_1k_1PC_snapkv snapkv microsoft/Phi-3.5-mini-instruct 1024 16 "/home/ya255/projects/all_contextual/expt_model/42_microsoft_Phi-3.5-mini-instruct_False_phi3_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_False_1_False_False_False_False_4_8_2/0.001_16_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_1024_1024_1_32_4_16_4_MSE_False_False_P35mini_1k_1PC.csv_P35mini_1k_1PC_True_0.3875000000000002_20250115-215417.pt"
-# bash eval_scan.sh P3mini_1k_1PC_snapkv.csv P3mini_1k_1PC_snapkv snapkv microsoft/Phi-3-mini-4k-instruct 1024 16 "/home/ya255/projects/all_contextual/expt_model/42_microsoft_Phi-3-mini-4k-instruct_False_phi3_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_False_1_False_False_False_False_4_8_2/0.001_16_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_1024_1024_1_32_4_16_4_MSE_False_False_P3mini_1k_1PC.csv_P3mini_1k_1PC_True_0.3875000000000002_20250115-200756.pt"
-
 # bash eval_scan.sh C4_L3_8B_80MTok_150MP_46MP.csv C4_L3_8B_80MTok_150MP_46MP ExpPred meta-llama/Meta-Llama-3.1-8B 1024 64 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Meta-Llama-3.1-8B_False_llama_qk_128_4_c4_realnewslike_0.5_False_False_finetune_None_None_2000_1_False_False_False_True_4_8_2_0.001/64_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_ICML_1000_1_1024_512_1_32_4_16_4_MSE_False_False_C4_L3_8B_80MTok_150MP_46MP.csv_C4_L3_8B_80MTok_150MP_46MP_True_0.3875000000000002__best.pt"
 #### Llama 3.2 1B
 # bash eval_scan.sh L3_1B_2k.csv L3_1B_2k ExpPred meta-llama/Llama-3.2-1B 1024 32 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Llama-3.2-1B_False_llama_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_1_False_False_False_False_4_8_2/0.001_32_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_2048_1024_1_16_4_16_4_MSE_False_False_L3_1B_2k.csv_L3_1B_2k_True_0.37500000000000006_20250110-062915.pt"
@@ -113,6 +104,7 @@ for perc in {10..60..10}; do
         --result_file ${result_file} \
         --wname ${wname} \
         --pred_lr 1e-3 \
+        --sliding_window 16 \
         --dDash ${dDash} \
         --intdim ${intdim} \
         --task_list '${task_list}' \
@@ -145,6 +137,10 @@ for perc in {10..60..10}; do
     fi
 
     # Execute the command
-    echo "Running: $cmd"
-    eval $cmd
+    echo "$cmd"
+    # eval $cmd
+
+    # # Execute the command
+    # echo "Running: $cmd"
+    # eval $cmd
 done

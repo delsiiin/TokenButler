@@ -286,7 +286,7 @@ class LlamaAttentionExperimental(nn.Module):
                         
 
                         sorted_indices = sorted_indices[:, :, -q_len:, :]
-                        mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                        mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
                         if self.sliding_window is not None:
                             if not hasattr(self, "window_cache"):
                                 self.window_cache = SlidingWindowCache(max_seq_len=1024,
@@ -318,7 +318,7 @@ class LlamaAttentionExperimental(nn.Module):
                     # here, it should be q_len, key_len i think. -- init max size and then pick
                     sorted_indices = ll_six.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_heads, key_len, key_len).to(query_states.device)
                     sorted_indices = sorted_indices[:, :, -q_len:, :]
-                    mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                    mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, None)
                     if self.sliding_window is not None:
                         if not hasattr(self, "window_cache"):
                             self.window_cache = SlidingWindowCache(max_seq_len=1024,
@@ -341,7 +341,7 @@ class LlamaAttentionExperimental(nn.Module):
                     grouped_attn_weights = torch.softmax(grouped_attn_weights + attention_mask, dim=-1, dtype=torch.float32)
                     _, sorted_indices = grouped_attn_weights.sort(dim=-1, descending=True)
                     sorted_indices = sorted_indices[:, :, -q_len:, :]
-                    mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                    mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                     final_mask = mask_tensor
                     attn_weights = attn_weights + mask_tensor + attention_mask
@@ -403,8 +403,9 @@ class LlamaAttentionExperimental(nn.Module):
                         
                         for i in range(1, q_len):
                             # step_budget = max(int((i + 1 - obs_size) * self.sparse_aggression), min_sparse_index)
-                            # Here, sparsity target is 'ADDITIONAL' to sliding window.
-                            step_budget = max(int((i + 1) * self.sparse_aggression), min_sparse_index)
+                            # Either no step budget, or a step budget that increases linearly with query index
+                            # Sliding window and anchor is guaranteed, so we msut subtract from budget
+                            step_budget = max(int((i + 1 - obs_size - min_sparse_index) * self.sparse_aggression), 0)
                             # step_budget = max(int((i + 1) * self.sparse_aggression), min_sparse_index)
                             # step_budget = max_budget
                             obs_start = max(0, i - obs_size + 1)
@@ -555,8 +556,11 @@ class LlamaAttentionExperimental(nn.Module):
 
                         for i in range(1, q_len):
                             kv_cache_budget = torch.full((combined_bh,),
-                                                        max(min_sparse_index, int((i + 1) * self.sparse_aggression)),
+                                                        max(min_sparse_index, int((i + 1 - self.sliding_window - min_sparse_index) * self.sparse_aggression)),
                                                         device=attn_weights.device)
+                            # kv_cache_budget = torch.full((combined_bh,),
+                            #                             max(min_sparse_index, int((i + 1) * self.sparse_aggression)),
+                            #                             device=attn_weights.device)
                             row_weights = attn_weights_2d[:, i, :i + 1]
                             can_add = active_counts < kv_cache_budget
                             add_indices = can_add.nonzero(as_tuple=False).squeeze(-1)
@@ -646,7 +650,7 @@ class LlamaAttentionExperimental(nn.Module):
                         _, sorted_indices = importance_mask.sort(dim=-1, descending=False)
 
                     sorted_indices = sorted_indices[:, :, -q_len:, :]
-                    mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                    mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                     final_mask = mask_tensor
                     if self.sliding_window is not None:

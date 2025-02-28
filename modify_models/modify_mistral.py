@@ -211,7 +211,7 @@ class MistralAttentionExperimental(nn.Module):
                         importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
                         sorted_indices = torch.argsort(importance_mask, dim=-1, descending=True)
                         sorted_indices = sorted_indices[:, :, -q_len:, :]
-                        mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                        mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
                         if self.sliding_window is not None:
                             if not hasattr(self, "window_cache"):
                                 self.window_cache = SlidingWindowCache(max_seq_len=1024,
