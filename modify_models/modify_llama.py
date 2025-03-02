@@ -61,6 +61,7 @@ class LlamaAttentionExperimental(nn.Module):
         self.train_headpredictor = False
         self.calibrate_thresholds = False
         self.test_with_thresholds = False
+        self.old_predictor = None
 
         if self.layer_idx > 0:
             self.mseloss = MSELoss(reduction='none')
@@ -83,22 +84,23 @@ class LlamaAttentionExperimental(nn.Module):
         self._init_rope()
         
     def update_predictor(self):
+        assert self.old_predictor is not None, "Old predictor not set! Please set it to ensure correct eval -- temporary measure."
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
             self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-            intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor
+            intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor, old_predictor=self.old_predictor
         ).to('cuda:0')
         self.sparse_token_predictor.flash_attn = self.flash_attn
         if self.train_headpredictor:
             self.sparse_head_predictor = HeadImportancePredictor(
                 self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor
+                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor, old_predictor=self.old_predictor
             ).to('cuda:0')
             self.sparse_head_predictor.flash_attn = self.flash_attn
         else:
             # initialize very small model to keep in-memory for seq-len 2048
             self.sparse_head_predictor = HeadImportancePredictor(
                 self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = 4, \
-                intdim = 16, attn_reduce_factor=(self.pred_hid_size // self.num_heads)
+                intdim = 16, attn_reduce_factor=(self.pred_hid_size // self.num_heads), old_predictor=self.old_predictor
             ).to('cuda:0')
             # Dont use flash-attention if head-prediction is in pseudo mdoe.
             # self.sparse_head_predictor.flash_attn = False
@@ -110,10 +112,13 @@ class LlamaAttentionExperimental(nn.Module):
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
         if self.token_sparse_method is not None:
-            mname = self.config._name_or_path.split("/")[-1]
-            read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
-            threshold_model_dictionary = torch.load(read_path)
-            self.tok_calibration_set = threshold_model_dictionary
+            try:
+                mname = self.config._name_or_path.split("/")[-1]
+                read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
+                threshold_model_dictionary = torch.load(read_path)
+                self.tok_calibration_set = threshold_model_dictionary
+            except:
+                pass
         if self.token_sparse_method == "LazyLLM":
             if self.layer_idx <= 9:
                 self.sparse_aggression = 1
@@ -337,6 +342,7 @@ class LlamaAttentionExperimental(nn.Module):
                     q_importance_tensor = q_importance_tensor.view(bsz, self.num_heads, q_len, self.dDash)
                     k_importance_tensor = k_importance_tensor.view(bsz, self.num_heads, key_len, self.dDash)
                     device_index = query_states.device.index
+                    assert self.lookahead == 0, "Lookahead not supported with flash attention yet. Please disable --flash_attn"
                     with torch.cuda.device(device_index):
                         attn_output, mse_loss = attention_mse_loss(query_states.contiguous().to(torch.float16),
                                                                     key_states.contiguous().to(torch.float16),
@@ -375,7 +381,17 @@ class LlamaAttentionExperimental(nn.Module):
                         # plt.savefig(f"attn_weights_{self.layer_idx}.png", dpi=600)
                         # exit()
 
-                        self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
+                        # Over here, attn_weights are [BH, L, L]
+                        # importance_mask is [BH, L, L]
+                        # To do 'lookahead' token importance prediction, we need to 
+                        # 'offset' importance mask target with attn_weights target
+                        # Since it is [Lq, Lk], we need to offset attn_weights by 1.
+                        # In its general form, for 'T'-Lookahead, we want
+                        # So, we want self.mseloss(attn_weights[:, :, T:, :], importance_mask[:, :, :-T, :])
+                        if self.lookahead == 0:
+                            self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
+                        else:
+                            self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
                         self.msemagn_loss = (self.msemagn_loss).mean(dim=(-1, -2))
                         self.msemagn_loss = self.msemagn_loss.mean()
 

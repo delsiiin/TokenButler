@@ -138,7 +138,7 @@ for perc in {10..60..10}; do
 
     # Execute the command
     echo "$cmd"
-    # eval $cmd
+    eval $cmd
 
     # # Execute the command
     # echo "Running: $cmd"

@@ -104,10 +104,13 @@ class MistralAttentionExperimental(nn.Module):
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
         if self.token_sparse_method is not None:
-            mname = self.config._name_or_path.split("/")[-1]
-            read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
-            threshold_model_dictionary = torch.load(read_path)
-            self.tok_calibration_set = threshold_model_dictionary
+            try:
+                mname = self.config._name_or_path.split("/")[-1]
+                read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
+                threshold_model_dictionary = torch.load(read_path)
+                self.tok_calibration_set = threshold_model_dictionary
+            except:
+                pass
         if self.token_sparse_method == "LazyLLM":
             if self.layer_idx <= 9:
                 self.sparse_aggression = 1
@@ -260,6 +263,7 @@ class MistralAttentionExperimental(nn.Module):
                     k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float() # [BH, Lk, D']
                     q_importance_tensor = q_importance_tensor.view(bsz, self.num_heads, q_len, self.dDash)
                     k_importance_tensor = k_importance_tensor.view(bsz, self.num_heads, key_len, self.dDash)
+                    assert self.lookahead == 0, "Lookahead not supported with flash attention yet. Please disable --flash_attn"
                     attn_output, mse_loss = attention_mse_loss(query_states.contiguous().to(torch.float16),
                                                                 key_states.contiguous().to(torch.float16),
                                                                 value_states.contiguous().to(torch.float16),
@@ -287,7 +291,12 @@ class MistralAttentionExperimental(nn.Module):
                     importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
 
                     if self.lfunc == "MSE":
-                        self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
+                        if self.lookahead == 0:
+                            self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
+                        else:
+                            import pdb; pdb.set_trace()
+                            self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
+                        # self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
                         self.msemagn_loss = (self.msemagn_loss).mean(dim=(-1, -2))
                         self.msemagn_loss = self.msemagn_loss.mean()
 

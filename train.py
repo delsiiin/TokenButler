@@ -511,6 +511,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         for name, param in model.named_parameters():
             print(f"Layer: {name}, Device: {param.device}")
     max_seq_len = args.rpj_train_seqlen
+    # 4 batch size with 8192 seq len attempt -- no work
     batch_size = 1  # Adjust based on your GPU memory
 
     print("Loading training dataset...")
@@ -759,15 +760,20 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                     save_checkpoint(args, model, optimizer, scheduler, step=step, epoch=epoch, note="intermediate")
 
                 if grad_norm.item() > 20000:
+                # if grad_norm.item() > 150:
                     print(f"Gradient norm: {grad_norm.item()}, skipped steps: {num_grad_skip}")
                     print("Skipping step due to high gradient norm.")
                     num_grad_skip += 1
                     scheduler.step()
                     optimizer.zero_grad()
                     if dowandb:
+                        try:
+                            hloss = (100 * head_match_loss).item()
+                        except:
+                            hloss = 0
                         wandb.log({
                             "MSE_Attn_Loss": mse_match_loss.item(),
-                            "Head_Loss": (100 * head_match_loss).item(),
+                            "Head_Loss": hloss,
                             "Head Hit Acc": avg_headhit,
                             "Token Hit Acc": avg_tokhit,
                             "Head Hit Corr": avg_headhit_corr,
@@ -884,10 +890,12 @@ if __name__ == '__main__':
     parser.add_argument('--model_mode', type=str, default="eval", choices=["eval", "finetune", "shadowllm"])
     parser.add_argument('--model_load_path', type=str, default=None, help='Path to load model')
     parser.add_argument('--model_resume_path', type=str, default=None, help='Path to resume training (includes optimizer, scheduler, and step states).')
-    parser.add_argument('--save_interval', type=int, default=5000, help='Number of steps after which to save a checkpoint.')
+    parser.add_argument('--save_interval', type=int, default=200, help='Number of steps after which to save a checkpoint.')
 
     # Current focus 
     parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
+    parser.add_argument('--old_predictor', action='store_true', help='Old Predictor without proper LayerNorm implementations :(')
+    parser.add_argument('--lookahead', type=int, default=0)
     # Current focus 
     parser.add_argument('--sliding_window', type=int, default=None, help='Sliding window at eval IF comparing to SnapKV, set it to 16: Very Important!!!!!')
     parser.add_argument('--randomize_init', action='store_true', help='Very Experimental! Tries to train predictor on RANDOMLY initialized transformer...')
@@ -905,7 +913,7 @@ if __name__ == '__main__':
     parser.add_argument('--skip_outlier', type=int, default=None, help='Skip backprop when task loss is outlier, stabilizes training. Not done on WK2, only RPJ.')
 
     parser.add_argument('--no_pred_causal_mask', action='store_true', help='Enable or disable causal mask application')
-    parser.add_argument('--evalgap', type=int, default=1000, help='eval gap during training')
+    parser.add_argument('--evalgap', type=int, default=200, help='eval gap during training')
     parser.add_argument('--max_norm', type=int, default=20, help='Max Norm')
     parser.add_argument('--intdim', type=int, default=512, help='Int-Proc Dim')
     parser.add_argument('--token_sparse_method', type=str, default="progressive_5pc", help="LazyLLM, progressive_xpc, fixed_xpc...")
@@ -1119,6 +1127,8 @@ if __name__ == '__main__':
             module.flash_attn = args.flash_attn
             module.train_headpredictor = args.train_headpredictor
             module.min_sparse_index = args.min_sparse_index
+            module.lookahead = args.lookahead
+            module.old_predictor = args.old_predictor
             module.num_layers_pred = module.producer_frequency  # Literally the gap is the number of layers to predict for.
             module.sliding_window = args.sliding_window
 

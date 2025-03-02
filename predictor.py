@@ -58,7 +58,7 @@ class PredictorDynamicCache(DynamicCache):
 
 class TokenImportancePredictorAttentive(nn.Module):
     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
-                 attn_reduce_factor, dropout=0.1):
+                 attn_reduce_factor, old_predictor, dropout=0.1):
         """
         Optimized Token Importance Predictor with parallel Q-K projections and simplified mapping.
         
@@ -84,6 +84,7 @@ class TokenImportancePredictorAttentive(nn.Module):
         self.attn_reduce_factor = attn_reduce_factor
         self.max_position_embeddings = config.max_position_embeddings
         self.flash_attn = False
+        self.old_predictor = old_predictor
         assert pred_hid_size % (num_heads * 4) == 0, "pred_hid_size must be divisible by num_heads * 4."
 
         # Reduce the hidden size for attention computations
@@ -113,6 +114,10 @@ class TokenImportancePredictorAttentive(nn.Module):
             nn.Linear(self.ffn_hidden_size, self.hidden_size),
             nn.Dropout(self.dropout)
         )
+        # Add extra LayerNorm for the importance branch when not using the old design.
+        if not self.old_predictor:
+            self.norm_importance = nn.LayerNorm(self.hidden_size)
+
         # Define Q and K projection layers for all layers in parallel with non-linearity[]
         # Output shape: [B, L, N * H * D']
         self.q_proj_importance = nn.Sequential(
@@ -246,16 +251,27 @@ class TokenImportancePredictorAttentive(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced)
         attn_output = self.norm1(attn_output)
         ffn_output = self.ffn(attn_output)
-        hidden_states = hidden_states + ffn_output
+        # Temporary measure, till old predictor fully deprecated
+        if not self.old_predictor:
+            hidden_states = self.norm2(hidden_states + ffn_output)
+        else:
+            hidden_states = hidden_states + ffn_output
 
         B, L, E = hidden_states.size()
         # Importance projections
         H = self.num_heads
         N = self.num_hidden_layers
 
-        # Shape after projection: [B, L, N * H * D']
-        q_importance = self.q_proj_importance(hidden_states)  # [B, L, N * H * D']
-        k_importance = self.k_proj_importance(hidden_states)  # [B, L, N * H * D']
+        # Temporary measure, till old predictor fully deprecated
+        if not self.old_predictor:
+            hidden_states_for_importance = self.norm_importance(hidden_states)
+        else:
+            hidden_states_for_importance = hidden_states
+        q_importance = self.q_proj_importance(hidden_states_for_importance)
+        k_importance = self.k_proj_importance(hidden_states_for_importance)
+        # # Shape after projection: [B, L, N * H * D']
+        # q_importance = self.q_proj_importance(hidden_states)  # [B, L, N * H * D']
+        # k_importance = self.k_proj_importance(hidden_states)  # [B, L, N * H * D']
 
         # Reshape and permute to [B, N, H, L, D']
         q_importance = q_importance.view(B, L, N, H, self.dDash).permute(0, 2, 3, 1, 4).contiguous()  # [B, N, H, L, D']
@@ -292,7 +308,7 @@ class TokenImportancePredictorAttentive(nn.Module):
 
 class HeadImportancePredictor(nn.Module):
     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
-                 attn_reduce_factor, dropout=0.1):
+                 attn_reduce_factor, old_predictor, dropout=0.1):
         """
         Optimized Token Importance Predictor with parallel Q-K projections and simplified mapping.
         
@@ -319,6 +335,7 @@ class HeadImportancePredictor(nn.Module):
         self.attn_reduce_factor = attn_reduce_factor
         self.max_position_embeddings = config.max_position_embeddings
         self.flash_attn = False
+        self.old_predictor = old_predictor
 
         # Reduce the hidden size for attention computations
         self.hidden_size_reduced = self.hidden_size // self.attn_reduce_factor  # For example, reduce to 1/4th
