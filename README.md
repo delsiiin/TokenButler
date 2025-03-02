@@ -53,7 +53,11 @@ We provide scripts for the following models:
 - **microsoft/Phi-3.5-mini-instruct**
 - **microsoft/Phi-3-mini-4k-instruct**
 
-Training requires 1 A6000 GPU for these variants, model parallelism support for larger trainin runs is WIP!
+Training requires 1 A6000 GPU for these variants.
+
+## Model Parallel Support
+
+Simply append `--model_parallelism` to split model across GPUs for longer-context length training runs.
 
 # Predictor Architecture
 
