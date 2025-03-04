@@ -19,7 +19,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaAttention, apply_rotary_pos_emb
 
 from utils import LlamaLinearScalingRotaryEmbedding, LlamaDynamicNTKScalingRotaryEmbedding, repeat_kv, sorted_index_to_mask
-from utils import calculate_hit_metrics, calculate_effective_sparsity, threshold_to_mask
+from utils import calculate_hit_metrics, calculate_effective_sparsity, threshold_to_mask, SlidingWindowCache, enforce_sliding_window
 from transformers.cache_utils import DynamicCache
 from predictor import TokenImportancePredictorAttentive, PredictorDynamicCache, HeadImportancePredictor, attention_mse_loss, attention
 from threshold_calib_dict import *
@@ -61,7 +61,7 @@ class LlamaAttentionExperimental(nn.Module):
         self.train_headpredictor = False
         self.calibrate_thresholds = False
         self.test_with_thresholds = False
-        self.tok_calibration_set = threshold_model_dictionary.get(config._name_or_path, None)
+        self.old_predictor = None
 
         if self.layer_idx > 0:
             self.mseloss = MSELoss(reduction='none')
@@ -84,25 +84,26 @@ class LlamaAttentionExperimental(nn.Module):
         self._init_rope()
         
     def update_predictor(self):
+        assert self.old_predictor is not None, "Old predictor not set! Please set it to ensure correct eval -- temporary measure."
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
             self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-            intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor
+            intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor, old_predictor=self.old_predictor
         ).to('cuda:0')
         self.sparse_token_predictor.flash_attn = self.flash_attn
         if self.train_headpredictor:
             self.sparse_head_predictor = HeadImportancePredictor(
                 self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor
+                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor, old_predictor=self.old_predictor
             ).to('cuda:0')
             self.sparse_head_predictor.flash_attn = self.flash_attn
         else:
             # initialize very small model to keep in-memory for seq-len 2048
             self.sparse_head_predictor = HeadImportancePredictor(
                 self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = 4, \
-                intdim = 16, attn_reduce_factor=(self.pred_hid_size // self.num_heads)
+                intdim = 16, attn_reduce_factor=(self.pred_hid_size // self.num_heads), old_predictor=self.old_predictor
             ).to('cuda:0')
             # Dont use flash-attention if head-prediction is in pseudo mdoe.
-            self.sparse_head_predictor.flash_attn = False
+            # self.sparse_head_predictor.flash_attn = False
 
     def set_head_sparsity(self, head_sparsity_aggression, global_prune):
         self.head_sparsity_aggression = head_sparsity_aggression
@@ -110,6 +111,14 @@ class LlamaAttentionExperimental(nn.Module):
 
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
+        if self.token_sparse_method is not None:
+            try:
+                mname = self.config._name_or_path.split("/")[-1]
+                read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
+                threshold_model_dictionary = torch.load(read_path)
+                self.tok_calibration_set = threshold_model_dictionary
+            except:
+                pass
         if self.token_sparse_method == "LazyLLM":
             if self.layer_idx <= 9:
                 self.sparse_aggression = 1
@@ -268,8 +277,8 @@ class LlamaAttentionExperimental(nn.Module):
                             sorted_indices = sorted_indices[:, :, -q_len:, :]
                             sorted_values, sorted_ix = torch.sort(importance_mask, dim=-1)
                             sorted_true_values, _ = torch.sort(torch.gather(unadj_importance_mask, dim=-1, index=sorted_ix), dim=-1)
-                            true_thresholds = sorted_true_values[:, :, :, importance_mask.size(-1)//2]
-                            thresholds = sorted_values[:, :, :, importance_mask.size(-1)//2]
+                            true_thresholds = sorted_true_values[:, :, :, int(importance_mask.size(-1) * self.sparse_aggression)]
+                            thresholds = sorted_values[:, :, :, int(importance_mask.size(-1) * self.sparse_aggression)]
                             self.true_threshmean = true_thresholds
                             self.threshmean = thresholds
                         if self.test_with_thresholds:
@@ -280,8 +289,15 @@ class LlamaAttentionExperimental(nn.Module):
                             importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
                             sorted_indices = torch.argsort(importance_mask, dim=-1, descending=True)
                             sorted_indices = sorted_indices[:, :, -q_len:, :]
-                            mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression)
+                            mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
                         ### Threshold variance investigation
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                    sliding_window=self.sliding_window,
+                                                                    device=mask_tensor.device)
+                            window = self.window_cache.get_window(q_len, key_len)
+                            mask_tensor = enforce_sliding_window(mask_tensor, window)
                         final_mask = mask_tensor
 
                         self.final_mask_investigate = final_mask
@@ -326,6 +342,7 @@ class LlamaAttentionExperimental(nn.Module):
                     q_importance_tensor = q_importance_tensor.view(bsz, self.num_heads, q_len, self.dDash)
                     k_importance_tensor = k_importance_tensor.view(bsz, self.num_heads, key_len, self.dDash)
                     device_index = query_states.device.index
+                    assert self.lookahead == 0, "Lookahead not supported with flash attention yet. Please disable --flash_attn"
                     with torch.cuda.device(device_index):
                         attn_output, mse_loss = attention_mse_loss(query_states.contiguous().to(torch.float16),
                                                                     key_states.contiguous().to(torch.float16),
@@ -364,7 +381,17 @@ class LlamaAttentionExperimental(nn.Module):
                         # plt.savefig(f"attn_weights_{self.layer_idx}.png", dpi=600)
                         # exit()
 
-                        self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
+                        # Over here, attn_weights are [BH, L, L]
+                        # importance_mask is [BH, L, L]
+                        # To do 'lookahead' token importance prediction, we need to 
+                        # 'offset' importance mask target with attn_weights target
+                        # Since it is [Lq, Lk], we need to offset attn_weights by 1.
+                        # In its general form, for 'T'-Lookahead, we want
+                        # So, we want self.mseloss(attn_weights[:, :, T:, :], importance_mask[:, :, :-T, :])
+                        if self.lookahead == 0:
+                            self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
+                        else:
+                            self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
                         self.msemagn_loss = (self.msemagn_loss).mean(dim=(-1, -2))
                         self.msemagn_loss = self.msemagn_loss.mean()
 
@@ -386,7 +413,7 @@ class LlamaAttentionExperimental(nn.Module):
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
                 attn_output = torch.matmul(attn_weights, value_states)
 
-        if self.layer_idx > 0:
+        if self.layer_idx > 0 and self.train_headpredictor:
             head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency].float().to(attn_output.device)
             attn_head_weights = attn_output.mean(dim=-1).permute(0, 2, 1)
             self.headmsemagn_loss = self.headmseloss(attn_head_weights, head_importance_tensor).mean()
@@ -397,6 +424,11 @@ class LlamaAttentionExperimental(nn.Module):
                     true_importance=attn_head_weights,
                     top_k_ratio=0.5
                 )
+        else:
+            self.headmsemagn_loss = 0
+            if self.calc_hitrates:
+                self.head_hit_acc, self.head_mean_rank_corr, self.head_max_rank_corr = 0, 0, 0
+
             
         checkeverytime = hasattr(self, 'test_with_thresholds')
         if checkeverytime:
@@ -435,14 +467,15 @@ class LlamaAttentionExperimental(nn.Module):
                     past_key_value=past_key_value_sp, 
                     use_cache=use_cache
                 )
-                head_importances, past_key_value_hp = self.sparse_head_predictor(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value_hp,
-                    use_cache=use_cache
-                )
-                head_importances = head_importances.view(bsz, q_len, self.num_heads, self.num_hidden_layers) # [B L H N]
+                if self.train_headpredictor:
+                    head_importances, past_key_value_hp = self.sparse_head_predictor(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value_hp,
+                        use_cache=use_cache
+                    )
+                    head_importances = head_importances.view(bsz, q_len, self.num_heads, self.num_hidden_layers) # [B L H N]
                 q_len = attn_output.size(1)
                 k_len = k_importance.size(-1)
             except:
@@ -452,10 +485,11 @@ class LlamaAttentionExperimental(nn.Module):
             self.q_importance = q_importance
             self.k_importance = k_importance
 
-            if self.head_importances is None:
-                self.head_importances = head_importances
-            else:
-                self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
+            if self.train_headpredictor:
+                if self.head_importances is None:
+                    self.head_importances = head_importances
+                else:
+                    self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
 
 
         if use_cache:

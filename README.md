@@ -21,6 +21,10 @@ Please download our trained TokenButler predictor models from `To Be Added`
 
 To evaluate, example scripts are provided in `eval_scan.sh`
 
+### Notice on predictor design change:
+Currently, please also add an argument --old_predictor to evaluations.
+In earlier predictors, we had not used LayerNorm everywhere -- predictors still work, but we are now moving to proper LayerNorm integration for more stabilized training.
+
 ### Example script (Please update checkpoint path after downloading models):
 ```
 bash eval_scan.sh L3_3B_2k_1PC.csv L3_3B_2k_1PC ExpPred meta-llama/Llama-3.2-3B 1024 16 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Llama-3.2-3B_False_llama_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_1_False_False_False_False_4_8_2/0.001_16_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_2048_1024_1_28_4_16_4_MSE_False_False_L3_3B_2k_1PC.csv_L3_3B_2k_1PC_True_0.38571428571428584_20250111-042334.pt"
@@ -53,7 +57,11 @@ We provide scripts for the following models:
 - **microsoft/Phi-3.5-mini-instruct**
 - **microsoft/Phi-3-mini-4k-instruct**
 
-Training requires 1 A6000 GPU for these variants, model parallelism support for larger trainin runs is WIP!
+Training requires 1 A6000 GPU for these variants.
+
+## Model Parallel Support
+
+Simply append `--model_parallelism` to split model across GPUs for longer-context length training runs.
 
 # Predictor Architecture
 

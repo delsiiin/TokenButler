@@ -47,8 +47,12 @@ import re
 scaler = GradScaler('cuda', enabled=True)
 global dowandb
 dotenv.load_dotenv()
-hftoken = os.getenv("HFTOKEN")
-# login(token=hftoken)
+try:
+    hftoken = os.getenv("HFTOKEN")
+    login(token=hftoken)
+except:
+    print("Warning: HF-Login may be needed!")
+    pass
 
 torch.backends.cuda.enable_flash_sdp(True)
 
@@ -308,7 +312,7 @@ def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_l
                 module.flash_attn = False
     return results['results']
 
-def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=False):
+def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=False, config=None):
     """
     Evaluates the model on the Wikitext-2 dataset using perplexity.
 
@@ -397,33 +401,60 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
             tok_hit_rates = torch.tensor(tok_hit_rates).mean().item()
             tok_mean_rank_corr = torch.tensor(tok_mean_rank_corr).mean().item()
             tok_max_rank_corr = torch.tensor(tok_max_rank_corr).mean().item()
-            head_hit_rates = torch.tensor(head_hit_rates).mean().item()
-            head_mean_rank_corr = torch.tensor(head_mean_rank_corr).mean().item()
-            head_max_rank_corr = torch.tensor(head_max_rank_corr).mean().item()
-
+            try:
+                head_hit_rates = torch.tensor(head_hit_rates).mean().item()
+                head_mean_rank_corr = torch.tensor(head_mean_rank_corr).mean().item()
+                head_max_rank_corr = torch.tensor(head_max_rank_corr).mean().item()
+            except:
+                head_hit_rates = 0
+                head_mean_rank_corr = 0
+                head_max_rank_corr = 0
             avg_tok_hit_rate.append(tok_hit_rates)
             avg_head_hit_rate.append(head_hit_rates)
-    print(f"Average Token Hit Rate: {100*sum(avg_tok_hit_rate) / len(avg_tok_hit_rate)}%")
-    print(f"Average Head Hit Rate: {100*sum(avg_head_hit_rate) / len(avg_head_hit_rate)}%")
-    ### Threshold variance investigation
-    if args.calibrate_thresholds:
-        threshold_tensor = torch.stack([x for x in threshold_mean if x.size(-1)==1024]).view(-1, 31, 32, 1024)
-        true_threshold_tensor = torch.stack([x for x in true_threshmean if x.size(-1)==1024]).view(-1, 31, 32, 1024)
-        mean_threshold_postattn, mean_threshold_predpresm = plot_thresholds(threshold_tensor, true_threshold_tensor)
-        print(mean_threshold_predpresm)
-        print("Please Store Calibration Values Appropriately In threshold_calib_dict to enable testing with thresholding!")
-    if args.test_with_thresholds:
-        effective_sparsity_list = torch.tensor(effective_sparsity_list)
-        mean_sparsity = effective_sparsity_list.mean().item()
-        stddev_sparsity = effective_sparsity_list.std().item()
-        print("You tried to use calibrated values for testing expected sparsity.")
-        print("Mean Sparsity: ", mean_sparsity)
-        print("Stddev Sparsity: ", stddev_sparsity)
-    ### Threshold variance investigation
     # Compute perplexity
     avg_loss = total_loss / total_tokens
     perplexity = torch.exp(torch.tensor(avg_loss))
     print(f"Perplexity evaluation completed: {perplexity.item()}")
+    print(f"Average Token Hit Rate: {100*sum(avg_tok_hit_rate) / len(avg_tok_hit_rate)}%")
+    print(f"Average Head Hit Rate: {100*sum(avg_head_hit_rate) / len(avg_head_hit_rate)}%")
+    model_name = args.model_path.split("/")[-1]
+    ### Threshold variance investigation
+    if args.calibrate_thresholds:
+        # Get number of layers in model
+        nlayers = config.num_hidden_layers
+        nheads = config.num_attention_heads
+        threshold_tensor = torch.stack([x for x in threshold_mean if x.size(-1)==1024]).view(-1, nlayers - 1, nheads, 1024)
+        true_threshold_tensor = torch.stack([x for x in true_threshmean if x.size(-1)==1024]).view(-1, nlayers - 1, nheads, 1024)
+        mean_threshold_postattn, mean_threshold_predpresm = plot_thresholds(threshold_tensor, true_threshold_tensor, model_name, args.token_sparse_method)
+        # We can save the mean_threshold_predpresm
+        # The reference to the dict should be named as model name and sparsity target
+        # check if a directory called threshold_calibs exists
+        if not os.path.exists("threshold_calibs"):
+            os.makedirs("threshold_calibs")
+        # Now, make a dir with model name if it doesnt exist
+        if not os.path.exists(f"threshold_calibs/{model_name}"):
+            os.makedirs(f"threshold_calibs/{model_name}")
+        # now, for the sparsity target (args.sparse_aggression), save a pkl file with mean_threshold_predpresm
+        with open(f"threshold_calibs/{model_name}/{args.token_sparse_method}.pkl", "wb") as f:
+            torch.save(mean_threshold_predpresm, f)
+        print(mean_threshold_predpresm)
+        exit(0)
+    if args.test_with_thresholds:
+        effective_sparsity_list = torch.tensor(effective_sparsity_list)
+        mean_sparsity = effective_sparsity_list.mean().item()
+        stddev_sparsity = effective_sparsity_list.std().item()
+        # Here, write to a file calib_info.csv in append more
+        # write the model_name, token_sparse_method, mean_sparsity, stddev_sparsity, perplexity
+        if not os.path.exists("calib_info.csv"):
+            with open("calib_info.csv", "w") as f:
+                f.write("model_name,token_sparse_method,mean_sparsity,stddev_sparsity,perplexity\n")
+        with open("calib_info.csv", "a") as f:
+            f.write(f"{model_name},{args.token_sparse_method},{mean_sparsity},{stddev_sparsity},{perplexity}\n")
+
+        print("You tried to use calibrated values for testing expected sparsity.")
+        print("Mean Sparsity: ", mean_sparsity)
+        print("Stddev Sparsity: ", stddev_sparsity)
+    ### Threshold variance investigation
     for module in model.modules():
         if module.__class__.__name__.endswith("AttentionExperimental"):
             module.calc_hitrates = False
@@ -480,6 +511,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         for name, param in model.named_parameters():
             print(f"Layer: {name}, Device: {param.device}")
     max_seq_len = args.rpj_train_seqlen
+    # 4 batch size with 8192 seq len attempt -- no work
     batch_size = 1  # Adjust based on your GPU memory
 
     print("Loading training dataset...")
@@ -689,9 +721,10 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                         if hasattr(module, 'msemagn_loss'):
                             nlayers += 1
                             mse_match_loss += module.msemagn_loss.to('cuda:0')
-                            head_match_loss += module.headmsemagn_loss.to('cuda:0')
                             module.msemagn_loss = 0
-                            module.headmsemagn_loss = 0
+                            if args.train_headpredictor:
+                                head_match_loss += module.headmsemagn_loss.to('cuda:0')
+                                module.headmsemagn_loss = 0
                             if calc_hitrates:
                                 headhit_accs.append(module.head_hit_acc)
                                 tok_hit_accs.append(module.tok_hit_acc)
@@ -700,7 +733,10 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
 
                 mse_match_loss = mse_match_loss / nlayers
                 observed_task_losses.append(mse_match_loss.item())
-                observed_head_losses.append(head_match_loss.item())
+                if args.train_headpredictor:
+                    observed_head_losses.append(head_match_loss.item())
+                else:
+                    observed_head_losses.append(0)
                 if calc_hitrates:
                     avg_headhit = 100 * sum(headhit_accs) / len(headhit_accs)
                     avg_tokhit = 100 * sum(tok_hit_accs) / len(tok_hit_accs)
@@ -724,15 +760,20 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                     save_checkpoint(args, model, optimizer, scheduler, step=step, epoch=epoch, note="intermediate")
 
                 if grad_norm.item() > 20000:
+                # if grad_norm.item() > 150:
                     print(f"Gradient norm: {grad_norm.item()}, skipped steps: {num_grad_skip}")
                     print("Skipping step due to high gradient norm.")
                     num_grad_skip += 1
                     scheduler.step()
                     optimizer.zero_grad()
                     if dowandb:
+                        try:
+                            hloss = (100 * head_match_loss).item()
+                        except:
+                            hloss = 0
                         wandb.log({
                             "MSE_Attn_Loss": mse_match_loss.item(),
-                            "Head_Loss": (100 * head_match_loss).item(),
+                            "Head_Loss": hloss,
                             "Head Hit Acc": avg_headhit,
                             "Token Hit Acc": avg_tokhit,
                             "Head Hit Corr": avg_headhit_corr,
@@ -759,7 +800,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 if step % eval_freq == 0:
                     print("Subset-eval here.")
                     set_inference_mode(model, True)
-                    eval_pplx, _ = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=True)
+                    eval_pplx, _ = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=True, config=config)
                     if dowandb:
                         wandb.log({"traintime_pplx": eval_pplx})
                     if args.do_downstream_eval:
@@ -781,9 +822,13 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                     torch.cuda.empty_cache()
                     gc.collect()
                 if dowandb:
+                    if args.train_headpredictor:
+                        hloss = (100 * head_match_loss).item()
+                    else:
+                        hloss = 0
                     wandb.log({
                         "MSE_Attn_Loss": mse_match_loss.item(),
-                        "Head_Loss": (100 * head_match_loss).item(),
+                        "Head_Loss": hloss,
                         "Head Hit Acc": avg_headhit,
                         "Token Hit Acc": avg_tokhit,
                         "Head Hit Corr": avg_headhit_corr,
@@ -797,6 +842,8 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                         "TrainProgress": float(train_progress / len(data_loader)),
                     })
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f"An error occurred: {e}")
 
             except Exception as e:
@@ -843,11 +890,14 @@ if __name__ == '__main__':
     parser.add_argument('--model_mode', type=str, default="eval", choices=["eval", "finetune", "shadowllm"])
     parser.add_argument('--model_load_path', type=str, default=None, help='Path to load model')
     parser.add_argument('--model_resume_path', type=str, default=None, help='Path to resume training (includes optimizer, scheduler, and step states).')
-    parser.add_argument('--save_interval', type=int, default=5000, help='Number of steps after which to save a checkpoint.')
+    parser.add_argument('--save_interval', type=int, default=200, help='Number of steps after which to save a checkpoint.')
 
     # Current focus 
     parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
+    parser.add_argument('--old_predictor', action='store_true', help='Old Predictor without proper LayerNorm implementations :(')
+    parser.add_argument('--lookahead', type=int, default=0)
     # Current focus 
+    parser.add_argument('--sliding_window', type=int, default=None, help='Sliding window at eval IF comparing to SnapKV, set it to 16: Very Important!!!!!')
     parser.add_argument('--randomize_init', action='store_true', help='Very Experimental! Tries to train predictor on RANDOMLY initialized transformer...')
     parser.add_argument('--test_with_thresholds', action='store_true', help='Test With Per-Head Token Thresholding, must have calibrated before!')
     parser.add_argument('--gfac', type=int, default=1)
@@ -863,7 +913,7 @@ if __name__ == '__main__':
     parser.add_argument('--skip_outlier', type=int, default=None, help='Skip backprop when task loss is outlier, stabilizes training. Not done on WK2, only RPJ.')
 
     parser.add_argument('--no_pred_causal_mask', action='store_true', help='Enable or disable causal mask application')
-    parser.add_argument('--evalgap', type=int, default=1000, help='eval gap during training')
+    parser.add_argument('--evalgap', type=int, default=200, help='eval gap during training')
     parser.add_argument('--max_norm', type=int, default=20, help='Max Norm')
     parser.add_argument('--intdim', type=int, default=512, help='Int-Proc Dim')
     parser.add_argument('--token_sparse_method', type=str, default="progressive_5pc", help="LazyLLM, progressive_xpc, fixed_xpc...")
@@ -905,6 +955,10 @@ if __name__ == '__main__':
     random.seed(args.seed)
     os.environ["PYTHONHASHSEED"] = str(args.seed)
 
+    print("IF EVALUATING: To compare with SnapKV Fairly, please set --sliding_window to 16 for experiments.")
+    # if args.sliding_window is not None:
+    #     print("\n", "*"*50)
+    #     print("SLIDING WINDOW ONLY APPLIES TO BASELINE EVALUATIONS -- I.E., ONLY WHEN _baselines.py VARIANT IS IMPORTED.")
 
     if dowandb:
         if args.wname is not None:
@@ -953,7 +1007,8 @@ if __name__ == '__main__':
             # strategy for llama3
             device_num_layers = config.num_hidden_layers // (device_cnt - 1)
             for i in range(config.num_hidden_layers):
-                device_map[f"model.layers.{i}"] = (i // device_num_layers + 1) % device_cnt
+                # device_map[f"model.layers.{i}"] = (i // device_num_layers + 1) % device_cnt
+                device_map[f"model.layers.{i}"] = (i % (device_cnt - 1)) + 1
             device_map[f'model.layers.{0}'] = 0
         dtype = torch.float16 if args.model_mode == "eval" else torch.float32
         model = AutoModelForCausalLM.from_pretrained(
@@ -1072,7 +1127,10 @@ if __name__ == '__main__':
             module.flash_attn = args.flash_attn
             module.train_headpredictor = args.train_headpredictor
             module.min_sparse_index = args.min_sparse_index
+            module.lookahead = args.lookahead
+            module.old_predictor = args.old_predictor
             module.num_layers_pred = module.producer_frequency  # Literally the gap is the number of layers to predict for.
+            module.sliding_window = args.sliding_window
 
             if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
                 if module.layer_idx % args.producer_frequency == 0:
@@ -1161,7 +1219,7 @@ if __name__ == '__main__':
         gc.collect()
         perplexity = 0
         if args.do_wikitext_eval:
-            perplexity, eval_mask = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=False)
+            perplexity, eval_mask = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=False, config=config)
             print(f"Perplexity on Wikitext-2: {perplexity:.2f}")
         if args.do_downstream_eval:
             print("Evaluating on additional tasks...")

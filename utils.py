@@ -32,6 +32,38 @@ import matplotlib.cm as cm
 from scipy.spatial.distance import cosine
 from tqdm import tqdm
 
+class SlidingWindowCache:
+    def __init__(self, max_seq_len, sliding_window, device):
+        self.sliding_window = sliding_window
+        self.device = device
+        if sliding_window is None:
+            self.max_seq_len = 0
+            self.window = None
+        else:
+            self.max_seq_len = max_seq_len
+            self.window = self._create_window(self.max_seq_len)
+
+    def _create_window(self, seq_len):
+        idx = torch.arange(seq_len, device=self.device)
+        query = idx.unsqueeze(1)  # [seq_len, 1]
+        key = idx.unsqueeze(0)    # [1, seq_len]
+        win = (key >= (query - self.sliding_window + 1)) & (key <= query)
+        return win.unsqueeze(0).unsqueeze(0)  # [1,1,seq_len,seq_len]
+
+    def get_window(self, q_len, key_len):
+        if self.sliding_window is None:
+            return None
+        req = max(q_len, key_len)
+        if req > self.max_seq_len:
+            self.max_seq_len = req
+            self.window = self._create_window(self.max_seq_len)
+        return self.window[:, :, :q_len, :key_len]
+
+def enforce_sliding_window(mask_tensor, window):
+    if window is None:
+        return mask_tensor
+    return mask_tensor.masked_fill(window, 0.0)
+
 
 def sanitize_filename(name):
     return re.sub(r'[<>:"/\\|?*\'\[\]]', '_', name)
@@ -163,43 +195,114 @@ def calculate_effective_sparsity(final_mask, attention_mask):
     effective_sparsity = 100 * (additional_deact.float() / num_active.float()).mean().item()
     return effective_sparsity
 
-def sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, sparse_aggression):
+# def sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, sparse_aggression):
+#     device = sorted_indices.device
+#     dtype = sorted_indices.dtype
+#     # Step 1: Calculate the number of keys to keep for each query position
+#     # K = ceil((query_position + 1) * sparse_aggression)
+#     # Shape: [1, 1, Lq, 1]
+#     query_positions = torch.arange(q_len, device=device).view(1, 1, q_len, 1).float() + 1.0  # 1-based indexing
+#     K = torch.ceil(query_positions * sparse_aggression).to(dtype=torch.long)  # [1, 1, Lq, 1]
+#     # Ensure K does not exceed key_len
+#     K = torch.clamp(K, max=key_len)
+#     # Step 2: Expand attention_mask to match sorted_indices shape
+#     # attention_mask: [1, 1, Lq, Lk] -> [B, H, Lq, Lk]
+#     attention_mask_expanded = attention_mask.expand(bsz, -1, -1, -1)  # [B, 1, Lq, Lk]
+#     attention_mask_expanded = attention_mask_expanded.expand(-1, sorted_indices.size(1), -1, -1)  # [B, H, Lq, Lk]
+#     attention_mask_expanded = (~attention_mask_expanded.bool()).int()
+#     # Step 3: Gather attention_mask based on sorted_indices
+#     # This rearranges the attention_mask to follow the sorted order of keys
+#     gathered_mask = torch.gather(attention_mask_expanded, dim=-1, index=sorted_indices)  # [B, H, Lq, Lk]
+#     # Step 4: Convert gathered_mask to float for cumulative sum
+#     gathered_mask_float = gathered_mask.float()
+#     # Step 5: Compute cumulative sum along the sorted key dimension
+#     cum_sum = torch.cumsum(gathered_mask_float, dim=-1)  # [B, H, Lq, Lk]
+#     # Step 6: Create a mask where cumulative sum <= K_i
+#     # K has shape [1, 1, Lq, 1], expand it to [B, H, Lq, Lk] for comparison
+#     K_broadcast = K.view(1, 1, q_len, 1).expand(bsz, sorted_indices.size(1), q_len, key_len)  # [B, H, Lq, Lk]
+#     selected_mask = cum_sum <= K_broadcast  # [B, H, Lq, Lk], boolean
+#     # Step 7: Initialize mask_tensor with -inf
+#     mask_tensor = torch.full_like(attention_mask_expanded.to(torch.float32), float('-inf'))  # [B, H, Lq, Lk]
+#     # Step 8: Prepare values to scatter: 0 where selected_mask is True, else -inf
+#     # This ensures that only the selected positions are allowed (0), others remain disallowed (-inf)
+#     scatter_values = torch.zeros_like(gathered_mask_float)
+#     scatter_values = scatter_values.masked_fill(~selected_mask, float('-inf'))  # [B, H, Lq, Lk]
+#     # Step 9: Scatter the values back to the original key positions
+#     # For each sorted key position, place the corresponding scatter_value at the original key index
+#     mask_tensor.scatter_(-1, sorted_indices, scatter_values)
+#     # Step 10: Ensure mask_tensor has mask_tensor[:, :, :, :min_sparse_index] = 0 
+#     mask_tensor[:, :, :, :min_sparse_index] = 0.0
+#     return mask_tensor
+
+def sorted_index_to_mask(
+    sorted_indices,
+    attention_mask,
+    min_sparse_index,
+    bsz,
+    q_len,
+    key_len,
+    sparse_aggression,
+    sliding_window=None
+):
+    """
+    sorted_indices: [B, H, q_len, key_len]
+    attention_mask: [1, 1, q_len, key_len]  (True = keep, False = mask out, or vice versa)
+    min_sparse_index: guaranteed front region to keep
+    sliding_window: guaranteed trailing region (for each query) to keep
+    sparse_aggression: float in [0,1], fraction of keys to drop or keep
+    """
     device = sorted_indices.device
     dtype = sorted_indices.dtype
-    # Step 1: Calculate the number of keys to keep for each query position
-    # K = ceil((query_position + 1) * sparse_aggression)
-    # Shape: [1, 1, Lq, 1]
-    query_positions = torch.arange(q_len, device=device).view(1, 1, q_len, 1).float() + 1.0  # 1-based indexing
-    K = torch.ceil(query_positions * sparse_aggression).to(dtype=torch.long)  # [1, 1, Lq, 1]
-    # Ensure K does not exceed key_len
-    K = torch.clamp(K, max=key_len)
-    # Step 2: Expand attention_mask to match sorted_indices shape
-    # attention_mask: [1, 1, Lq, Lk] -> [B, H, Lq, Lk]
-    attention_mask_expanded = attention_mask.expand(bsz, -1, -1, -1)  # [B, 1, Lq, Lk]
-    attention_mask_expanded = attention_mask_expanded.expand(-1, sorted_indices.size(1), -1, -1)  # [B, H, Lq, Lk]
+
+    # Step 1: Compute base K
+    query_positions = torch.arange(q_len, device=device).view(1, 1, q_len, 1).float() + 1.0
+    K_original = torch.ceil(query_positions * sparse_aggression).long()  # [1,1,q_len,1]
+    K_original = torch.clamp(K_original, max=key_len)
+
+    # Step 1b: Incorporate guaranteed region
+    guaranteed = min_sparse_index
+    if sliding_window is not None:
+        guaranteed += sliding_window
+    # Subtract guaranteed from the original K
+    K_adjusted = K_original - guaranteed
+    # Ensure K_adjusted is at least 0
+    K_adjusted = torch.clamp(K_adjusted, min=0, max=key_len)
+
+    # Step 2: Expand attention_mask to [B,H,q_len,key_len]
+    attention_mask_expanded = attention_mask.expand(bsz, -1, -1, -1)
+    attention_mask_expanded = attention_mask_expanded.expand(-1, sorted_indices.size(1), -1, -1)
+    # Convert True -> 1, False -> 0
     attention_mask_expanded = (~attention_mask_expanded.bool()).int()
-    # Step 3: Gather attention_mask based on sorted_indices
-    # This rearranges the attention_mask to follow the sorted order of keys
-    gathered_mask = torch.gather(attention_mask_expanded, dim=-1, index=sorted_indices)  # [B, H, Lq, Lk]
-    # Step 4: Convert gathered_mask to float for cumulative sum
+
+    # Step 3: Gather (reorder) mask by sorted_indices
+    gathered_mask = torch.gather(attention_mask_expanded, dim=-1, index=sorted_indices)
+
+    # Step 4: cumsum along sorted dimension
     gathered_mask_float = gathered_mask.float()
-    # Step 5: Compute cumulative sum along the sorted key dimension
-    cum_sum = torch.cumsum(gathered_mask_float, dim=-1)  # [B, H, Lq, Lk]
-    # Step 6: Create a mask where cumulative sum <= K_i
-    # K has shape [1, 1, Lq, 1], expand it to [B, H, Lq, Lk] for comparison
-    K_broadcast = K.view(1, 1, q_len, 1).expand(bsz, sorted_indices.size(1), q_len, key_len)  # [B, H, Lq, Lk]
-    selected_mask = cum_sum <= K_broadcast  # [B, H, Lq, Lk], boolean
-    # Step 7: Initialize mask_tensor with -inf
-    mask_tensor = torch.full_like(attention_mask_expanded.to(torch.float32), float('-inf'))  # [B, H, Lq, Lk]
-    # Step 8: Prepare values to scatter: 0 where selected_mask is True, else -inf
-    # This ensures that only the selected positions are allowed (0), others remain disallowed (-inf)
+    cum_sum = torch.cumsum(gathered_mask_float, dim=-1)  # [B,H,q_len,key_len]
+
+    # Step 5: Compare cumsum <= K_adjusted
+    # Expand K_adjusted to [B,H,q_len,key_len] for broadcast
+    K_broadcast = K_adjusted.view(1, 1, q_len, 1).expand_as(cum_sum)
+    selected_mask = (cum_sum <= K_broadcast)
+
+    # Step 6: Prepare final mask_tensor with -inf by default
+    mask_tensor = torch.full_like(attention_mask_expanded.float(), float('-inf'))
+
+    # Step 7: Scatter 0 where selected, -inf otherwise
     scatter_values = torch.zeros_like(gathered_mask_float)
-    scatter_values = scatter_values.masked_fill(~selected_mask, float('-inf'))  # [B, H, Lq, Lk]
-    # Step 9: Scatter the values back to the original key positions
-    # For each sorted key position, place the corresponding scatter_value at the original key index
+    scatter_values = scatter_values.masked_fill(~selected_mask, float('-inf'))
     mask_tensor.scatter_(-1, sorted_indices, scatter_values)
-    # Step 10: Ensure mask_tensor has mask_tensor[:, :, :, :min_sparse_index] = 0 
+
+    # Step 8: Force the guaranteed front region unmasked
     mask_tensor[:, :, :, :min_sparse_index] = 0.0
+
+    # We do NOT forcibly unmask the trailing `sliding_window` here,
+    # because we typically do it with a separate function that
+    # ensures the last `sliding_window` positions are unmasked for each query.
+    # Replace with self.sliding_window where referenced
+    # Where not referenced, reduce budget in calculation.
+
     return mask_tensor
 
 def threshold_to_mask(unadj_importance_mask, perhead_thresholds, min_sparse_index, bsz, q_len, key_len):
@@ -302,7 +405,7 @@ def calculate_hit_metrics(estimated_importance: torch.Tensor,
 
     return hit_accuracy, mean_corr, max_corr
 
-def plot_thresholds(threshold_tensor, true_threshold_tensor):
+def plot_thresholds(threshold_tensor, true_threshold_tensor, fpath_base, fpath_specific):
     """
     Plots mean and error regions for random layers and heads, showing threshold changes across decode steps.
     
@@ -315,8 +418,8 @@ def plot_thresholds(threshold_tensor, true_threshold_tensor):
         Helper function to generate the plot.
         """
         # Choose 3 random layers
-        # layers = np.random.choice(tensor.shape[1], 3, replace=False)
-        layers = np.array([0, 15, 30])
+        layers = np.random.choice(tensor.shape[1], 3, replace=False)
+        # layers = np.array([0, 15, 30])
         
         # Create subplots
         fig, axs = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
@@ -327,16 +430,19 @@ def plot_thresholds(threshold_tensor, true_threshold_tensor):
             heads = np.random.choice(tensor.shape[2], 5, replace=False)
             
             for head in heads:
-                # Extract data for the selected layer and head
-                data = tensor[:, layer, head, :].numpy()  # Shape [163, 1024]
-                
-                # Compute mean and standard deviation across samples (dim=0)
-                mean = np.mean(data, axis=0)
-                std = np.std(data, axis=0)
-                
-                # Plot mean and shaded error region for the head
-                axs[i].plot(x, mean, label=f"Head {head}")
-                axs[i].fill_between(x, mean - std, mean + std, alpha=0.3)
+                try:
+                    # Extract data for the selected layer and head
+                    data = tensor[:, layer, head, :].numpy()  # Shape [163, 1024]
+                    
+                    # Compute mean and standard deviation across samples (dim=0)
+                    mean = np.mean(data, axis=0)
+                    std = np.std(data, axis=0)
+                    
+                    # Plot mean and shaded error region for the head
+                    axs[i].plot(x, mean, label=f"Head {head}")
+                    axs[i].fill_between(x, mean - std, mean + std, alpha=0.3)
+                except:
+                    import pdb; pdb.set_trace()
             
             # Customize subplot
             axs[i].set_title(f"Layer {layer}")
@@ -365,11 +471,16 @@ def plot_thresholds(threshold_tensor, true_threshold_tensor):
         
         return mean_threshold
 
+    # create folder fpath_base if it does not exist
+    if not os.path.exists(f"threshold_plots"):
+        os.makedirs(f"threshold_plots")
+    if not os.path.exists(f"threshold_plots/{fpath_base}"):
+        os.makedirs(f"threshold_plots/{fpath_base}")
     # Plot for threshold_tensor
-    create_plot(threshold_tensor, "Post-Attention Thresholds", "postattn_threshold.pdf")
+    create_plot(threshold_tensor, "Post-Attention Thresholds", f"threshold_plots/{fpath_base}/{fpath_specific}_postattn_threshold.pdf")
     
     # Plot for true_threshold_tensor
-    create_plot(true_threshold_tensor, "Predicted Pre-SM Thresholds", "pred_presm_threshold.pdf")
+    create_plot(true_threshold_tensor, "Predicted Pre-SM Thresholds", f"threshold_plots/{fpath_base}/{fpath_specific}_pred_presm_threshold.pdf")
 
     # Compute mean thresholds
     mean_threshold_postattn = compute_mean_threshold(threshold_tensor)
