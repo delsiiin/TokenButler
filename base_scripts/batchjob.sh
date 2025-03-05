@@ -11,8 +11,11 @@ while IFS= read -r CMD; do
 #SBATCH --account=abdelfattah
 #SBATCH --gpus=1
 #SBATCH --mem=120000
+#SBATCH --nodelist=abdelfattah-compute-03
+#SBATCH --partition=abdelfattah
 #SBATCH -N 1
 #SBATCH -n 2
+
 #SBATCH --time=16:00:00  # Adjust as needed
 
 # Load any required modules

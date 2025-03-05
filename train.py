@@ -329,10 +329,13 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
 
     # Use a subset of data if traintime_subset or args.eval_subset is specified
-    if traintime_subset:
-        dataset = dataset.select(range(1000))
-    elif args.eval_subset is not None:
-        dataset = dataset.select(range(args.eval_subset))
+    try:
+        if traintime_subset:
+            dataset = dataset.select(range(1000))
+        elif args.eval_subset is not None:
+            dataset = dataset.select(range(args.eval_subset))
+    except:
+        pass
     # dataset = dataset.select(range(100)) # Temporary, for snapKV fast-eval on downstream.
     # Concatenate all text entries
     concatenated_text = "\n\n".join(dataset["text"])
@@ -598,7 +601,16 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     print("Length of dataset before flattening: ", len(subset))
     oneitemlen = next(iter(subset))['input_ids'].shape
     print("One item length: ", oneitemlen)
-    subset = FlattenedDataset(subset, max_seq_len)
+    max_repeat_fraction = (
+        0.2 if max_seq_len <= 2048 else
+        0.15 if max_seq_len <= 4096 else
+        0.05 if max_seq_len <= 8192 else
+        0.05 if max_seq_len <= 16384 else
+        0.02
+    )
+    subset = FlattenedDataset(subset, max_seq_len, max_repeat_fraction)
+    # seq_len_to_repeat_fracs = 
+    # subset = FlattenedDataset(subset, max_seq_len)
     print("Length of dataset after flattening: ", len(subset))
     data_loader = DataLoader(subset, batch_size=batch_size, shuffle=True)
     print("Tokenization complete in ", time.time() - a, " seconds")
