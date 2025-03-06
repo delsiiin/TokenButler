@@ -653,6 +653,7 @@ if __name__ == '__main__':
 
     # Current focus 
     parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
+    parser.add_argument('--old_predictor', action='store_true', help='Old Predictor without proper LayerNorm implementations :(')
     # Current focus 
     parser.add_argument('--sliding_window', type=int, default=None, help='Sliding window at eval IF comparing to SnapKV, set it to 16: Very Important!!!!!')
     parser.add_argument('--randomize_init', action='store_true', help='Very Experimental! Tries to train predictor on RANDOMLY initialized transformer...')
@@ -872,6 +873,7 @@ if __name__ == '__main__':
             module.flash_attn = args.flash_attn
             module.train_headpredictor = args.train_headpredictor
             module.min_sparse_index = args.min_sparse_index
+            module.old_predictor = args.old_predictor
             module.num_layers_pred = module.producer_frequency  # Literally the gap is the number of layers to predict for.
             module.sliding_window = args.sliding_window
 

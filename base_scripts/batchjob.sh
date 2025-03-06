@@ -16,7 +16,7 @@ while IFS= read -r CMD; do
 #SBATCH -N 1
 #SBATCH -n 2
 
-#SBATCH --time=16:00:00  # Adjust as needed
+#SBATCH --time=48:00:00  # Adjust as needed
 
 # Load any required modules
 

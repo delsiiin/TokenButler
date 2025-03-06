@@ -361,7 +361,7 @@ class Phi3AttentionExperimental(nn.Module):
                             obs_size = 4
                         
                         for i in range(1, q_len):
-                            step_budget = max(int((i + 1 - obs_size - min_sparse_index) * self.sparse_aggression), 0)
+                            step_budget = max(int((i + 1 - obs_size - min_sparse_index) * self.sparse_aggression), 1)
                             # step_budget = max(int((i + 1) * self.sparse_aggression), min_sparse_index)
                             # step_budget = max_budget
                             obs_start = max(0, i - obs_size + 1)

@@ -19,9 +19,9 @@ name_mapping = {
 
     # "L3_1B_2k_1PC": "Llama-3.2-1B",
 filemap = {
+    "L3_3B_2k_1PC": "Llama-3.2-3B",
     "L2_7B_2k": "Llama-2-7b-hf",
     "L3_8B_1k": "Llama-3.1-8B",
-    "L3_3B_2k_1PC": "Llama-3.2-3B",
     "M7B_1k": "Mistral-7B-v0.1",
     "P35mini_1k_1PC": "Phi-3.5-mini-instruct",
     "P3mini_1k_1PC": "Phi-3-mini-4k-instruct"
@@ -111,8 +111,12 @@ def plot_graphs(data, metric, output_file):
                 # Get the min accuracy of h2o_true
                 min_accuracy = df[df['wname'] == "H2O"]['average_acc'].min()
                 max_accuracy = df[df['wname'] == "Oracle"]['average_acc'].max()
-                ax.set_ylim(min_accuracy * 0.96, max_accuracy * 1.01)
+                # if 'Mistral' in filemap[file_type]:
+                #     import pdb; pdb.set_trace()
+                # ax.set_ylim(min_accuracy * 0.96, max_accuracy * 1.01)
+                ax.set_ylim(min_accuracy * 0.995, max_accuracy * 1.001)
         except:
+            print(f"passing min-max find on {file_type}")
             pass
             # import pdb; pdb.set_trace()
     # Hide unused subplots
