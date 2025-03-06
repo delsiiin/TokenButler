@@ -998,13 +998,6 @@ if __name__ == '__main__':
         else:
             extra_param_device = 0
             device_map = {"model.embed_tokens": extra_param_device, "model.rotary_emb": extra_param_device, "model.norm": extra_param_device, "lm_head": extra_param_device}
-            # # strategy for llama2
-            # device_num_layers = config.num_hidden_layers // (device_cnt - 1)
-            # for i in range(config.num_hidden_layers):
-            #     device_map[f"model.layers.{i}"] = (i // device_num_layers + 1) % device_cnt
-            # device_map[f'model.layers.{0}'] = 0
-
-            # strategy for llama3
             device_num_layers = config.num_hidden_layers // (device_cnt - 1)
             for i in range(config.num_hidden_layers):
                 # device_map[f"model.layers.{i}"] = (i // device_num_layers + 1) % device_cnt

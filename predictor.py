@@ -34,7 +34,7 @@ class PredictorDynamicCache(DynamicCache):
         self.head_predictor_cache = None  # Add this for Head Importance Predictor
         self.h2o_importance = None
     
-    def update(self, key_states, value_states, layer_idx):
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         # First update the base cache
         key_states, value_states = super().update(key_states, value_states, layer_idx)
         return key_states, value_states
@@ -58,7 +58,7 @@ class PredictorDynamicCache(DynamicCache):
 
 class TokenImportancePredictorAttentive(nn.Module):
     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
-                 attn_reduce_factor, old_predictor, dropout=0.1):
+                 attn_reduce_factor, old_predictor=True, dropout=0.1):
         """
         Optimized Token Importance Predictor with parallel Q-K projections and simplified mapping.
         
@@ -309,7 +309,7 @@ class TokenImportancePredictorAttentive(nn.Module):
 
 class HeadImportancePredictor(nn.Module):
     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
-                 attn_reduce_factor, old_predictor, dropout=0.1):
+                 attn_reduce_factor, old_predictor=True, dropout=0.1):
         """
         Optimized Token Importance Predictor with parallel Q-K projections and simplified mapping.
         
