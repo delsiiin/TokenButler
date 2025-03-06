@@ -22,7 +22,6 @@ from utils import LlamaLinearScalingRotaryEmbedding, LlamaDynamicNTKScalingRotar
 from utils import calculate_hit_metrics, calculate_effective_sparsity, threshold_to_mask, SlidingWindowCache, enforce_sliding_window
 from transformers.cache_utils import DynamicCache
 from predictor import TokenImportancePredictorAttentive, PredictorDynamicCache, HeadImportancePredictor, attention_mse_loss, attention
-from threshold_calib_dict import *
 
 from triton_kernels.flash_attn import attention
 from triton_kernels.flash_attn_mse_loss import attention_mse_loss
@@ -84,30 +83,17 @@ class LlamaAttentionExperimental(nn.Module):
         self._init_rope()
         
     def update_predictor(self):
-        assert self.old_predictor is not None, "Old predictor not set! Please set it to ensure correct eval -- temporary measure."
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
             self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-            intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor, old_predictor=self.old_predictor
+            intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor
         ).to('cuda:0')
         self.sparse_token_predictor.flash_attn = self.flash_attn
         if self.train_headpredictor:
             self.sparse_head_predictor = HeadImportancePredictor(
                 self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor, old_predictor=self.old_predictor
+                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor
             ).to('cuda:0')
             self.sparse_head_predictor.flash_attn = self.flash_attn
-        else:
-            # initialize very small model to keep in-memory for seq-len 2048
-            self.sparse_head_predictor = HeadImportancePredictor(
-                self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = 4, \
-                intdim = 16, attn_reduce_factor=(self.pred_hid_size // self.num_heads), old_predictor=self.old_predictor
-            ).to('cuda:0')
-            # Dont use flash-attention if head-prediction is in pseudo mdoe.
-            # self.sparse_head_predictor.flash_attn = False
-
-    def set_head_sparsity(self, head_sparsity_aggression, global_prune):
-        self.head_sparsity_aggression = head_sparsity_aggression
-        self.head_global_prune = global_prune
 
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
@@ -186,17 +172,6 @@ class LlamaAttentionExperimental(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         Ltrack = hidden_states.size(1)
 
-        if q_len != 1:  # this is prefill stage for first token output, reset q-k importance tensors
-            self.q_importance = None
-            self.k_importance = None
-            self.head_importances = None
-        past_key_value_sp = None if past_key_value is None else past_key_value.get_predictor_cache()
-        past_key_value_hp = None if past_key_value is None else past_key_value.get_head_predictor_cache()
-
-        # if past_key_value_sp is not None:
-        #     print("Past Key Value Sparsity:", past_key_value_sp)
-
-
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
@@ -230,8 +205,6 @@ class LlamaAttentionExperimental(nn.Module):
         
         if use_cache:
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-            # key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            # value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         kv_seq_len = key_states.shape[-2]
         final_mask = None
@@ -242,17 +215,17 @@ class LlamaAttentionExperimental(nn.Module):
         key_len = key_states.size(2)
         bsz, q_len = query_states.size(0), query_states.size(2)
 
-        # Ahmed Modification. Always set an attention_mask
-        # Create causal mask if attention_mask is None
         if attention_mask is None:
-            # Create causal mask
-            # [bsz, 1, q_len, kv_seq_len]
-            # @Ahmed -- this should be corrected for decode.
-            causal_mask = torch.ones((bsz, 1, q_len, kv_seq_len), device=hidden_states.device, dtype=torch.bool)
-            causal_mask = causal_mask.triu(diagonal=1)  # Upper triangular part
-            attention_mask = torch.zeros_like(causal_mask, dtype=hidden_states.dtype)
-            attention_mask.masked_fill_(causal_mask, float("-inf"))
-        assert self.head_dim % self.group_factor == 0
+            # We want a [q_len, kv_seq_len] boolean upper-triangular mask
+            causal_mask_2d = torch.ones(q_len, kv_seq_len, 
+                                        device=hidden_states.device, 
+                                        dtype=torch.bool).triu(diagonal=1)
+            # Then shape it to [bsz, 1, q_len, kv_seq_len]
+            causal_mask_4d = causal_mask_2d.unsqueeze(0).expand(bsz, 1, q_len, kv_seq_len)
+            # Now fill -inf where the mask is True
+            attention_mask = torch.full_like(causal_mask_4d, 0, dtype=hidden_states.dtype)
+            attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
+
         if self.inference_mode:
             min_sparse_index = self.min_sparse_index
             with torch.no_grad():
@@ -305,28 +278,6 @@ class LlamaAttentionExperimental(nn.Module):
                     else:
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                         attn_weights = attn_weights + attention_mask
-                elif evalmode == "ReplAttn":
-                    if self.layer_idx > 0:
-                        q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device)
-                        k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device)
-                        importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash)
-                        importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len)
-                        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-                        if self.calc_hitrates:
-                            self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
-                                estimated_importance=importance_mask,
-                                true_importance=attn_weights,
-                                top_k_ratio=0.5
-                            )
-                        num_heads_to_keep = int(self.num_heads * (1 - self.sparse_aggression))
-                        head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency]
-                        indices = torch.argsort(head_importance_tensor.mean(dim=1), dim=-1, descending=False)[:, :num_heads_to_keep].squeeze()
-                        attn_weights[:, indices, :, :] = importance_mask[:, indices, :, :]
-                        attn_weights = attn_weights + attention_mask
-                    else:
-                        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-                        attn_weights = attn_weights + attention_mask
-
                 else:
                     raise ValueError(f"Unknown eval mode {evalmode}")
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
@@ -359,10 +310,6 @@ class LlamaAttentionExperimental(nn.Module):
                         raise ValueError(f"NaN loss detected: {mse_loss}")
                 else:
                     attn_output = torch.nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=None, is_causal=True)
-                    # attn_output = attention(query_states.contiguous().to(torch.float16), 
-                    #                         key_states.contiguous().to(torch.float16),
-                    #                         value_states.contiguous().to(torch.float16), True, 1.0 / math.sqrt(self.head_dim))
-                    # attn_output = attn_output.to(query_states.dtype)
             else:
                 attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)   
                 if self.layer_idx > 0:
@@ -371,44 +318,21 @@ class LlamaAttentionExperimental(nn.Module):
                     importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
                     importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
 
-                    if self.lfunc == "MSE":
-                        # # Here, save the attn_weights[0, 0] as a heatmap 
-                        # import matplotlib.pyplot as plt
-                        # import seaborn as sns
-                        # # virdis colors
-                        # sns.heatmap(attn_weights[0, 0].detach().cpu().numpy(), cmap='viridis')
-                        # # save it as fig
-                        # plt.savefig(f"attn_weights_{self.layer_idx}.png", dpi=600)
-                        # exit()
-
-                        # Over here, attn_weights are [BH, L, L]
-                        # importance_mask is [BH, L, L]
-                        # To do 'lookahead' token importance prediction, we need to 
-                        # 'offset' importance mask target with attn_weights target
-                        # Since it is [Lq, Lk], we need to offset attn_weights by 1.
-                        # In its general form, for 'T'-Lookahead, we want
-                        # So, we want self.mseloss(attn_weights[:, :, T:, :], importance_mask[:, :, :-T, :])
-                        if self.lookahead == 0:
-                            self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
-                        else:
-                            self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
-                        self.msemagn_loss = (self.msemagn_loss).mean(dim=(-1, -2))
-                        self.msemagn_loss = self.msemagn_loss.mean()
-
-                        if self.calc_hitrates:
-                            self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
-                                estimated_importance=importance_mask,
-                                true_importance=attn_weights,
-                                top_k_ratio=0.5
-                            )
-
+                    if self.lookahead == 0:
+                        self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
                     else:
-                        raise ValueError(f"Unknown loss function {self.lfunc}")
-                if attention_mask is not None:
-                    if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                        raise ValueError(
-                            f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                        self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
+                    self.msemagn_loss = (self.msemagn_loss).mean(dim=(-1, -2))
+                    self.msemagn_loss = self.msemagn_loss.mean()
+
+                    if self.calc_hitrates:
+                        self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
+                            estimated_importance=importance_mask,
+                            true_importance=attn_weights,
+                            top_k_ratio=0.5
                         )
+
+                if attention_mask is not None:
                     attn_weights = attn_weights + attention_mask
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
                 attn_output = torch.matmul(attn_weights, value_states)
@@ -460,12 +384,13 @@ class LlamaAttentionExperimental(nn.Module):
 
         if self.producer is None:
             try:
-                q_importance, k_importance, past_key_value_sp = self.sparse_token_predictor(
-                    hidden_states, 
-                    attention_mask=attention_mask, 
-                    position_ids=position_ids, 
-                    past_key_value=past_key_value_sp, 
-                    use_cache=use_cache
+                q_importance, k_importance = self.sparse_token_predictor(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,  # the same single cache
+                    use_cache=use_cache,
+                    layer_idx=self.layer_idx,       # or pass 0
                 )
                 if self.train_headpredictor:
                     head_importances, past_key_value_hp = self.sparse_head_predictor(
@@ -490,25 +415,12 @@ class LlamaAttentionExperimental(nn.Module):
                     self.head_importances = head_importances
                 else:
                     self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
-
-
-        if use_cache:
-            if self.producer is None: # This is the producer layer
-                past_key_value.update_predictors(past_key_value_sp, past_key_value_hp)
-
         
         if not output_attentions:
             attn_weights = None
-
-        if q_len == 1:
-            if self.layer_idx == 31:
-                print(past_key_value.key_cache[0].shape, "\tDecoded\t", self.numd)
-            self.numd += 1
-        else:
-            self.numd = 0
         return attn_output, attn_weights
 
-def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
+def convert_kvcache_experimental(model, config, producer_frequency):
     producer_layer = None
     producer_layer_device = None
     layer_counter = {'idx': 0}
@@ -533,9 +445,6 @@ def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=
                         layer_idx=layer_counter['idx']
                     ).to(dtype).to(device)
                 new_module.load_state_dict(module.state_dict(), strict=False)
-                new_module.heavy_const = heavy_const
-                new_module.group_factor = group_factor
-                new_module.label_bits = label_bits
                 is_producer = layer_counter['idx'] % producer_frequency == 0
                 if is_producer:
                     print(f"Converted Producer layer '{name}' to LlamaAttentionExperimental at layer index {layer_counter['idx']}")
@@ -545,13 +454,4 @@ def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=
                 layer_counter['idx'] += 1
     recurse_convert(model)
     producer_layer = producer_layer.to(producer_layer_device)
-    return model
-
-def convert_llama_channel_config_experimental(model, channel_config, selected_channel="k"):
-    selected_channel = "." + selected_channel + "_proj"
-    for name, module in model.named_modules():
-        if isinstance(module, LlamaAttentionExperimental):
-            device = next(module.parameters()).device
-            module.sorted_channel = torch.tensor(channel_config[name + selected_channel]).to(device)
-
     return model

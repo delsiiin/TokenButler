@@ -16,6 +16,7 @@ import seaborn as sns
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from random import seed, sample
 
+from typing import Any, Dict, List, Optional, Tuple
 from lm_eval.models.huggingface import HFLM
 from lm_eval.utils import make_table
 import lm_eval
@@ -26,6 +27,7 @@ import pprint
 import csv
 from torch.nn import CrossEntropyLoss
 
+from transformers.optimization import get_cosine_schedule_with_warmup
 from torch.cuda.amp import autocast, GradScaler
 from transformers.optimization import get_cosine_schedule_with_warmup
 
@@ -33,7 +35,6 @@ from huggingface_hub import login
 
 from utils import FlattenedDataset, plot_thresholds, sanitize_filename, args_to_name
 
-### New imports
 from longbench_utils import scorer, MODEL2MAXLEN, DATASET2PROMPT, DATASET2MAXLEN
 from datasets import load_from_disk
 
@@ -44,9 +45,11 @@ from torch.cuda.amp import autocast
 import dotenv
 import wandb
 import re
+
 scaler = GradScaler('cuda', enabled=True)
 global dowandb
 dotenv.load_dotenv()
+
 try:
     hftoken = os.getenv("HFTOKEN")
     login(token=hftoken)
@@ -66,12 +69,10 @@ def save_model(args, model, note=None):
     passargs.model_resume_path = None
 
     folder_name, file_name = args_to_name(passargs, timestamp)
-    # Final path
     folder_path = "expt_model/" + folder_name
     if not os.path.exists("expt_model"):
         os.makedirs("expt_model")
     os.makedirs(folder_path, exist_ok=True)
-    # Complete save path
     model_savepath_name = os.path.join(folder_path, file_name)
     if note is not None:
         model_savepath_name += "_" + note
@@ -268,6 +269,14 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
         preds.append({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj.get("all_classes", None), "length": json_obj.get("length", None)})
     return preds
 
+def patched_prepare_cache_for_generation(
+    self, generation_config, model_kwargs: Dict, *args, **kwargs
+):
+    # Normally, huggingface tries to do: model_kwargs["past_key_values"] = DynamicCache()
+    # We override it with ours:
+    if "past_key_values" not in model_kwargs or model_kwargs["past_key_values"] is None:
+        model_kwargs["past_key_values"] = PredictorDynamicCache()
+    return model_kwargs
 
 def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_list=["arc_easy", "hellaswag"], limit=None, flash_attn=False, train_headpredictor=False):
 
@@ -275,15 +284,6 @@ def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_l
         module.flash_attn = False
     model.seqlen = max_length
     lm_obj = HFLM(pretrained=model, tokenizer=tokenizer, add_bos_token=False, batch_size=batch_size)
-
-
-    original_forward = lm_obj.model.forward
-    def patched_forward(*args, **kwargs):
-        if not isinstance(kwargs["past_key_values"], PredictorDynamicCache):
-            kwargs["past_key_values"] = PredictorDynamicCache()
-        return original_forward(*args, **kwargs)
-
-    lm_obj.model.forward = patched_forward
 
     task_manager = lm_eval.tasks.TaskManager()
     print(f"Evaluating on tasks: {task_list}")
@@ -330,7 +330,7 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
             dataset = dataset.select(range(args.eval_subset))
     except:
         pass
-    # dataset = dataset.select(range(100)) # Temporary, for snapKV fast-eval on downstream.
+
     # Concatenate all text entries
     concatenated_text = "\n\n".join(dataset["text"])
     tokenized_output = tokenizer(concatenated_text, truncation=False)
@@ -360,7 +360,7 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
 
     for chunk in progress_bar:
         batch = input_chunks[chunk].unsqueeze(0).to(model.device)
-        if batch.size(1) < 2:  # Skip sequences too short for meaningful evaluation
+        if batch.size(1) < 2:
             continue
         with autocast():
             with torch.no_grad():
@@ -435,13 +435,13 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
         with open(f"threshold_calibs/{model_name}/{args.token_sparse_method}.pkl", "wb") as f:
             torch.save(mean_threshold_predpresm, f)
         print(mean_threshold_predpresm)
+        print("-"*20, " Calibration Threshold Saved, Exiting... ", "-"*20)
         exit(0)
+
     if args.test_with_thresholds:
         effective_sparsity_list = torch.tensor(effective_sparsity_list)
         mean_sparsity = effective_sparsity_list.mean().item()
         stddev_sparsity = effective_sparsity_list.std().item()
-        # Here, write to a file calib_info.csv in append more
-        # write the model_name, token_sparse_method, mean_sparsity, stddev_sparsity, perplexity
         if not os.path.exists("calib_info.csv"):
             with open("calib_info.csv", "w") as f:
                 f.write("model_name,token_sparse_method,mean_sparsity,stddev_sparsity,perplexity\n")
@@ -451,12 +451,14 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
         print("You tried to use calibrated values for testing expected sparsity.")
         print("Mean Sparsity: ", mean_sparsity)
         print("Stddev Sparsity: ", stddev_sparsity)
-    ### Threshold variance investigation
+
     for module in model.modules():
         if module.__class__.__name__.endswith("AttentionExperimental"):
             module.calc_hitrates = False
+
     if torch.isnan(perplexity):
         import pdb; pdb.set_trace()
+
     return perplexity.item(), None
 
 
@@ -507,9 +509,9 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 param = param.to('cuda:0')
         for name, param in model.named_parameters():
             print(f"Layer: {name}, Device: {param.device}")
-    max_seq_len = args.rpj_train_seqlen
-    # 4 batch size with 8192 seq len attempt -- no work
-    batch_size = 1  # Adjust based on your GPU memory
+    max_seq_len = args.train_seqlen
+
+    batch_size = args.train_batch_size  # Adjust based on your GPU memory
 
     print("Loading training dataset...")
     a = time.time()
@@ -533,11 +535,9 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 num_proc=4,
                 remove_columns=["text", "meta"]
             )
-            # Ensure parent directories are created
             os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
             dataset.save_to_disk(dataset_path)
 
-        # Remove unnecessary columns and set format
         dataset = dataset["train"].remove_columns([col for col in dataset["train"].column_names if col != "input_ids"])
         dataset.set_format(type='torch', columns=['input_ids'])
     elif args.finetune_dataset == "c4_realnewslike":
@@ -548,16 +548,13 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             dataset = load_dataset("allenai/c4", "realnewslike", split="train")
 
             tokenizer.model_max_length = max_seq_len
-            # if tokenizer.model_max_length > 262144:
-            #     tokenizer.model_max_length = 262144
-            # Take a x% random subset -- for testing purposes.
-            subset_size = int(0.04 * len(dataset))
+            # Hardcoded to use 4% of the dataset for tokenization.
+            subset_size = int(0.005 * len(dataset))
             indices = sample(range(len(dataset)), subset_size)
             dataset = dataset.select(indices)
 
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
-
             # Tokenize the dataset
             dataset = dataset.map(
                 partial(tokenize_fn, tokenizer),
@@ -567,11 +564,9 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 remove_columns=["url", "timestamp", "text"]  # Remove fields not needed
             )
 
-            # Save the processed dataset to disk for reuse
             os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
             dataset.save_to_disk(dataset_path)
 
-        # Remove unnecessary columns and set format
         dataset = dataset.remove_columns([col for col in dataset.column_names if col != "input_ids"])
         dataset.set_format(type="torch", columns=["input_ids"])
 
@@ -584,27 +579,17 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     else:
         subset_size = len(dataset)
 
-    # subset = dataset.select(range(subset_size))
-    # Shuffle the dataset to ensure random sampling
     assert args.seed is not None, "Seed must be provided to ensure consistent dataset shuffling for resuming."
     shuffled_dataset = dataset.shuffle(seed=args.seed)
 
-    # Select a random subset
     subset = shuffled_dataset.select(range(subset_size))
 
     print("Length of dataset before flattening: ", len(subset))
     oneitemlen = next(iter(subset))['input_ids'].shape
     print("One item length: ", oneitemlen)
-    max_repeat_fraction = (
-        0.2 if max_seq_len <= 2048 else
-        0.15 if max_seq_len <= 4096 else
-        0.05 if max_seq_len <= 8192 else
-        0.05 if max_seq_len <= 16384 else
-        0.02
-    )
-    subset = FlattenedDataset(subset, max_seq_len, max_repeat_fraction)
-    # seq_len_to_repeat_fracs = 
-    # subset = FlattenedDataset(subset, max_seq_len)
+
+    subset = FlattenedDataset(subset, max_seq_len, max_repeat_fraction = 0.05)
+
     print("Length of dataset after flattening: ", len(subset))
     data_loader = DataLoader(subset, batch_size=batch_size, shuffle=True)
     print("Tokenization complete in ", time.time() - a, " seconds")
@@ -616,8 +601,9 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     for producer_layer in producer_layers:
         for param in producer_layer.sparse_token_predictor.parameters():
             param.requires_grad = True
-        for param in producer_layer.sparse_head_predictor.parameters():
-            param.requires_grad = True
+        if args.train_headpredictor:
+            for param in producer_layer.sparse_head_predictor.parameters():
+                param.requires_grad = True
     
     print("Set producer layer parameters to require gradients.")
     
@@ -632,22 +618,18 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     mask_array = None
 
     print("Inference mode: False")
-    num_epochs = 1
     batch_item = next(iter(data_loader))
-    nsamples = len(data_loader) * num_epochs
-    tot_steps = nsamples * num_epochs
-    print("\n\n Total Steps: ", tot_steps, "\n\n")
+    nsamples = len(data_loader)
+    total_steps = nsamples
+    print("\n\n Total Steps: ", total_steps, "\n\n")
     
-    total_steps = tot_steps // args.grad_accum_steps
-    
-    from transformers.optimization import get_cosine_schedule_with_warmup
 
-    warmup_steps = int(0.1 * tot_steps)
+    warmup_steps = int(0.1 * total_steps)
 
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
-        num_training_steps=tot_steps
+        num_training_steps=total_steps
     )
     eval_freq = args.evalgap
     grad_norm = 0
@@ -669,288 +651,229 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         step = checkpoint['step']
-        # set wandb step
         current_step = checkpoint.get('wandb_step', 0)
-        # Fake the missing steps
         for step in range(current_step):
-            wandb.log({}, step=step)  # Log nothing but set the step
+            wandb.log({}, step=step)
         epoch = checkpoint.get('epoch', 0)
         step = checkpoint['step']
         print(f"Resumed at step {step}, epoch {epoch}")
     else:
         step = 0
         epoch = 0
-    # convert model to float16 half precision
-    # model = model.half()
-    # import pdb; pdb.set_trace()
+        
     avg_headhit, avg_tokhit = 0, 0
     avg_headhit_corr, avg_tokhit_corr = 0, 0
     train_progress = 0
-    for epoch in range(epoch, num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        epoch_loss = 0.0  # Reset epoch loss
-        running_loss = 0.0
-        progress_bar = tqdm.tqdm(data_loader, desc="Training...", initial=step % len(data_loader))
-        for batch_idx, batch in enumerate(progress_bar):
-            train_progress += 1
-            try:
-                if batch_idx < step:  # Skip processed batches in current epoch
-                    continue
-                calc_hitrates = False
-                for module in model.modules():
-                    # Match modules ending with AttentionExperimental
-                    if module.__class__.__name__.endswith("AttentionExperimental"):
-                        if step % 20 == 0:
-                            calc_hitrates = True
-                            module.calc_hitrates = calc_hitrates
-                        else:
-                            calc_hitrates = False
-                            module.calc_hitrates = False
+    epoch_loss = 0.0
+    running_loss = 0.0
+    progress_bar = tqdm.tqdm(data_loader, desc="Training...", initial=step % len(data_loader))
+    for batch_idx, batch in enumerate(progress_bar):
+        train_progress += 1
+        try:
+            if batch_idx < step:
+                continue
+            calc_hitrates = False
+            for module in model.modules():
+                if module.__class__.__name__.endswith("AttentionExperimental"):
+                    if step % 20 == 0:
+                        calc_hitrates = True
+                        module.calc_hitrates = calc_hitrates
+                    else:
+                        calc_hitrates = False
+                        module.calc_hitrates = False
 
-                input_ids = batch.to(model.device)
-                input_ids = input_ids[:, :max_seq_len]
-                total_tok_seen += input_ids.size(1) * input_ids.size(0)  # L * B
-                attention_mask = (input_ids != tokenizer.pad_token_id).long().to(model.device)
-                labels = input_ids.clone()
-                outputs = model(input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
-                task_loss = outputs.loss
-                mse_match_loss = 0
-                head_match_loss = 0
-                nlayers = 0
-                headhit_accs = []
-                tok_hit_accs = []
-                headhit_corr = []
-                tok_hit_corr = []
+            input_ids = batch.to(model.device)
+            input_ids = input_ids[:, :max_seq_len]
+            total_tok_seen += input_ids.size(1) * input_ids.size(0)  # L * B
+            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(model.device)
+            labels = input_ids.clone()
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
+            task_loss = outputs.loss
+            mse_match_loss = 0
+            head_match_loss = 0
+            nlayers = 0
+            headhit_accs, tok_hit_accs, headhit_corr, tok_hit_corr = [], [], [], []
 
-                for module in model.modules():
-                    if module.__class__.__name__.endswith("AttentionExperimental"):
-                        if hasattr(module, 'msemagn_loss'):
-                            nlayers += 1
-                            mse_match_loss += module.msemagn_loss.to('cuda:0')
-                            module.msemagn_loss = 0
-                            if args.train_headpredictor:
-                                head_match_loss += module.headmsemagn_loss.to('cuda:0')
-                                module.headmsemagn_loss = 0
-                            if calc_hitrates:
-                                headhit_accs.append(module.head_hit_acc)
-                                tok_hit_accs.append(module.tok_hit_acc)
-                                headhit_corr.append(module.head_mean_rank_corr)
-                                tok_hit_corr.append(module.tok_mean_rank_corr)
+            for module in model.modules():
+                if module.__class__.__name__.endswith("AttentionExperimental"):
+                    if hasattr(module, 'msemagn_loss'):
+                        nlayers += 1
+                        mse_match_loss += module.msemagn_loss.to('cuda:0')
+                        module.msemagn_loss = 0
+                        if args.train_headpredictor:
+                            head_match_loss += module.headmsemagn_loss.to('cuda:0')
+                            module.headmsemagn_loss = 0
+                        if calc_hitrates:
+                            headhit_accs.append(module.head_hit_acc)
+                            tok_hit_accs.append(module.tok_hit_acc)
+                            headhit_corr.append(module.head_mean_rank_corr)
+                            tok_hit_corr.append(module.tok_mean_rank_corr)
 
-                mse_match_loss = mse_match_loss / nlayers
-                observed_task_losses.append(mse_match_loss.item())
+            mse_match_loss = mse_match_loss / nlayers
+            observed_task_losses.append(mse_match_loss.item())
+            if args.train_headpredictor:
+                observed_head_losses.append(head_match_loss.item())
+            else:
+                observed_head_losses.append(0)
+            if calc_hitrates:
+                avg_headhit = 100 * sum(headhit_accs) / len(headhit_accs)
+                avg_tokhit = 100 * sum(tok_hit_accs) / len(tok_hit_accs)
+                avg_headhit_corr = sum(headhit_corr) / len(headhit_corr)
+                avg_tokhit_corr = sum(tok_hit_corr) / len(tok_hit_corr)
+
+            if args.train_headpredictor:
+                mse_match_loss.backward(retain_graph=True)
+                (100 * head_match_loss).backward()
+            else:
+                mse_match_loss.backward()
+
+            step += 1
+
+            for producer_layer in producer_layers:
+                grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_token_predictor.parameters(), max_norm=args.max_norm)
                 if args.train_headpredictor:
-                    observed_head_losses.append(head_match_loss.item())
-                else:
-                    observed_head_losses.append(0)
-                if calc_hitrates:
-                    avg_headhit = 100 * sum(headhit_accs) / len(headhit_accs)
-                    avg_tokhit = 100 * sum(tok_hit_accs) / len(tok_hit_accs)
-                    avg_headhit_corr = sum(headhit_corr) / len(headhit_corr)
-                    avg_tokhit_corr = sum(tok_hit_corr) / len(tok_hit_corr)
-
-                if args.train_headpredictor:
-                    mse_match_loss.backward(retain_graph=True)
-                    (100 * head_match_loss).backward()
-                else:
-                    mse_match_loss.backward()
-
-                step += 1
-
-                assert args.grad_accum_steps == 1, "Gradient accumulation not supported for now."
-                for producer_layer in producer_layers:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_token_predictor.parameters(), max_norm=args.max_norm)
                     head_grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_head_predictor.parameters(), max_norm=args.max_norm)
 
-                if step % args.save_interval == 0:
-                    save_checkpoint(args, model, optimizer, scheduler, step=step, epoch=epoch, note="intermediate")
+            if step % args.save_interval == 0:
+                save_checkpoint(args, model, optimizer, scheduler, step=step, epoch=epoch, note="intermediate")
 
-                if grad_norm.item() > 20000:
-                # if grad_norm.item() > 150:
-                    print(f"Gradient norm: {grad_norm.item()}, skipped steps: {num_grad_skip}")
-                    print("Skipping step due to high gradient norm.")
-                    num_grad_skip += 1
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    if dowandb:
-                        try:
-                            hloss = (100 * head_match_loss).item()
-                        except:
-                            hloss = 0
-                        wandb.log({
-                            "MSE_Attn_Loss": mse_match_loss.item(),
-                            "Head_Loss": hloss,
-                            "Head Hit Acc": avg_headhit,
-                            "Token Hit Acc": avg_tokhit,
-                            "Head Hit Corr": avg_headhit_corr,
-                            "Token Hit Corr": avg_tokhit_corr,
-                            "task_loss": task_loss.item(),
-                            "MSE_Attn_RunningLoss": running_loss,
-                            "grad_norm": grad_norm.item(),  # Log gradient norm
-                            "learning_rate": scheduler.get_last_lr()[0],  # Log current learning rate
-                            "total_tokens": total_tok_seen,
-                            "stepskip": 1,
-                            "TrainProgress": float(train_progress / len(data_loader)),
-                        })
-                    continue
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()  # Reset gradients after update
-
-                epoch_loss += mse_match_loss.item()
-                running_loss = (running_loss * step + mse_match_loss.item()) / (step + 1)
-                progress_bar.set_description(f"Training... (Running Loss: {running_loss:.4e})")
+            epoch_loss += mse_match_loss.item()
+            running_loss = (running_loss * step + mse_match_loss.item()) / (step + 1)
+            progress_bar.set_description(f"Training... (Running Loss: {running_loss:.4e})")
+            torch.cuda.empty_cache()
+            gc.collect()
+            if step % eval_freq == 0:
+                print("Subset-eval here.")
+                set_inference_mode(model, True)
+                eval_pplx, _ = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=True, config=config)
+                if dowandb:
+                    wandb.log({"traintime_pplx": eval_pplx})
+                if args.do_downstream_eval:
+                    if step % ( 4 * eval_freq ) == 0 and step > 10:
+                        print("Evaluating on additional tasks...")
+                        task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn, train_headpredictor=args.train_headpredictor)
+                        if dowandb:
+                            for task_name, task_res in task_results.items():
+                                try:
+                                    wandb.log({f"{task_name}": task_res['acc,none']})
+                                except KeyError:
+                                    pass
+                if eval_pplx < min_wk2:
+                    min_wk2 = eval_pplx
+                    print(f"New best model found with perplexity: {min_wk2:.4f}")
+                    save_model(args, model, note="_best")
+                set_inference_mode(model, False)
+                model.train()
                 torch.cuda.empty_cache()
                 gc.collect()
-                if step % eval_freq == 0:
-                    print("Subset-eval here.")
-                    set_inference_mode(model, True)
-                    eval_pplx, _ = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=True, config=config)
-                    if dowandb:
-                        wandb.log({"traintime_pplx": eval_pplx})
-                    if args.do_downstream_eval:
-                        if step % ( 4 * eval_freq ) == 0 and step > 10:
-                            print("Evaluating on additional tasks...")
-                            task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn, train_headpredictor=args.train_headpredictor)
-                            if dowandb:
-                                for task_name, task_res in task_results.items():
-                                    try:
-                                        wandb.log({f"{task_name}": task_res['acc,none']})
-                                    except KeyError:
-                                        pass
-                    if eval_pplx < min_wk2:
-                        min_wk2 = eval_pplx
-                        print(f"New best model found with perplexity: {min_wk2:.4f}")
-                        save_model(args, model, note="_best")
-                    set_inference_mode(model, False)
-                    model.train()
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                if dowandb:
-                    if args.train_headpredictor:
-                        hloss = (100 * head_match_loss).item()
-                    else:
-                        hloss = 0
-                    wandb.log({
-                        "MSE_Attn_Loss": mse_match_loss.item(),
-                        "Head_Loss": hloss,
-                        "Head Hit Acc": avg_headhit,
-                        "Token Hit Acc": avg_tokhit,
-                        "Head Hit Corr": avg_headhit_corr,
-                        "Token Hit Corr": avg_tokhit_corr,
-                        "task_loss": task_loss.item(),
-                        "MSE_Attn_RunningLoss": running_loss,
-                        "grad_norm": grad_norm.item(),  # Log gradient norm
-                        "learning_rate": scheduler.get_last_lr()[0],  # Log current learning rate
-                        "total_tokens": total_tok_seen,
-                        "stepskip": 1,
-                        "TrainProgress": float(train_progress / len(data_loader)),
-                    })
-            except Exception as e:
+            if dowandb:
+                if args.train_headpredictor:
+                    hloss = (100 * head_match_loss).item()
+                else:
+                    hloss = 0
+                wandb.log({
+                    "MSE_Attn_Loss": mse_match_loss.item(),
+                    "Head_Loss": hloss,
+                    "Head Hit Acc": avg_headhit,
+                    "Token Hit Acc": avg_tokhit,
+                    "Head Hit Corr": avg_headhit_corr,
+                    "Token Hit Corr": avg_tokhit_corr,
+                    "task_loss": task_loss.item(),
+                    "MSE_Attn_RunningLoss": running_loss,
+                    "grad_norm": grad_norm.item(),  # Log gradient norm
+                    "learning_rate": scheduler.get_last_lr()[0],  # Log current learning rate
+                    "total_tokens": total_tok_seen,
+                    "stepskip": 1,
+                    "TrainProgress": float(train_progress / len(data_loader)),
+                })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"An error occurred: {e}")
+
+        except Exception as e:
+            if "ScaledDotProductEfficientAttentionBackward0" in str(e):
+                print(f"RuntimeError encountered: {e}. Skipping this iteration.")
+                torch.cuda.empty_cache()
+                gc.collect()
+                continue  # Skip this batch
+            else:
+                print(f"Interesing error: {e}")
+                torch.cuda.empty_cache()
+                gc.collect()
                 import traceback
                 traceback.print_exc()
-                print(f"An error occurred: {e}")
-
-            except Exception as e:
-                if "ScaledDotProductEfficientAttentionBackward0" in str(e):
-                    print(f"RuntimeError encountered: {e}. Skipping this iteration.")
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    continue  # Skip this batch
-                else:
-                    print(f"Interesing error: {e}")
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    import traceback
-                    traceback.print_exc()
-                    import pdb; pdb.set_trace()
-                    continue
-        avg_train_loss = epoch_loss / nsamples
-        print(f"Average training loss for epoch {epoch+1}: {avg_train_loss:.4f}")
+                import pdb; pdb.set_trace()
+                continue
+    avg_train_loss = epoch_loss / nsamples
+    print(f"Average training loss for epoch {epoch+1}: {avg_train_loss:.4f}")
     return model, mask_array
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Your CLI description.')
-    # add a seed
+    # Base Arguments
+    parser.add_argument('--proj_name', type=str, default="AllContextual", help="Name for wandb project")
     parser.add_argument('--seed', type=int, default=42, help='Seed for reproducibility')
-
-    parser.add_argument('--model_path', type=str, default="meta-llama/Llama-2-7b-hf", help='Selected model')
-    parser.add_argument('--task_list', type=lambda s: [item for item in s.split(',')], default=["arc_easy", "hellaswag"], help='Comma-separated list of tasks for evaluation')
-    parser.add_argument('--offloading', action='store_true', help='Whether to use offloading')
+    parser.add_argument('--model_mode', type=str, default="eval", choices=["eval", "finetune"])
+    parser.add_argument('--model_load_path', type=str, default=None, help='Path to load model')
+    parser.add_argument('--model_resume_path', type=str, default=None, help='Path to resume training (includes optimizer, scheduler, and step states).')
+    parser.add_argument('--save_interval', type=int, default=200, help='Number of steps after which to save a checkpoint.')
     parser.add_argument('--architecture', type=str, default="llama", choices=["llama", "mistral", "mixtral", "qwen", "glm", "phi3"])
-    parser.add_argument('--channel', type=str, default="qk", choices=["q", "k", "qk"])
-    parser.add_argument('--heavy_const', type=int, default=128, help='Heavy constant')
-    parser.add_argument('--q_bits', type=int, default=4, help='Quantization bits')
+    parser.add_argument('--model_path', type=str, default="meta-llama/Llama-2-7b-hf", help='Selected model')
+    parser.add_argument('--result_file', type=str, default="all_results.csv", help="Where to save results.")
+    parser.add_argument('--wname', type=str, default=None, help="Name for wandb run")
+    parser.add_argument('--model_parallelism', action='store_true', help='Enable model parallelism')
+    parser.add_argument('--no_wandb', action='store_true', help='Enable or disable wandb logging')
+    parser.add_argument('--evalgap', type=int, default=200, help='eval gap during training')
+    parser.add_argument('--flash_attn', action='store_true', help='Use Flash Attention')
+    
+    # Train related arguments
     parser.add_argument('--finetune_dataset', type=str, default="wikitext", choices=["wikitext", "c4", "c4_realnewslike", "alpaca", "redpajama"], help='Dataset to use for fine-tuning')
-    parser.add_argument('--head_sparsity_aggression', type=float, default=0.5)
+    parser.add_argument('--train_seqlen', type=int, default=512)
+    parser.add_argument('--train_batch_size', type=int, default=1)
+    parser.add_argument('--train_subset_fac', type=int, default=None)
+    parser.add_argument('--max_norm', type=int, default=20, help='Max Norm')
+    parser.add_argument('--pred_lr', type=float, default=1e-3, help='Predictor learning rate')
+
+    # Evaluation Related Arguments
+    parser.add_argument('--eval_wk2_seqlen', type=int, default=512)
+    parser.add_argument('--num_tok_per_page', type=int, default=16, help='Number of tokens per page for Quest')
+    parser.add_argument('--no_wikitext_eval', action='store_true', help='Whether to perform Wikitext evaluation.')
+    parser.add_argument('--stream_llm_start_size', type=int, default=4, help='Num-sink tokens to keep for StreamingLLM')
+    parser.add_argument('--eval_subset', type=int, default=None)
+    parser.add_argument('--eval_llm_mode', type=str, default="TopSparse", help="oracle, lookahead_magnitude, lookahead_firstlayer_magnitude, predictor, h2o, streamingLLM")
+    parser.add_argument('--token_sparse_method', type=str, default="fixed_10pc", help="LazyLLM, progressive_xpc, fixed_xpc...")
+    parser.add_argument('--task_list', type=lambda s: [item for item in s.split(',')], default=["arc_easy", "hellaswag"], help='Comma-separated list of tasks for evaluation')
     parser.add_argument('--do_downstream_eval', action='store_true', help='Whether to perform downstream evaluation.')
-    # Added arguments for LongBench evaluation
     parser.add_argument('--do_longbench_eval', action='store_true', help='Whether to perform LongBench evaluation.')
     parser.add_argument('--longbench_datasets', type=lambda s: [item for item in s.split(',')], 
                         default=["triviaqa", "qasper", "trec", "samsum", "lcc", "repobench-p", "qmsum", "multi_news"],
                         help='Comma-separated list of datasets for LongBench evaluation')
-    # Custom control arguments
-    parser.add_argument('--model_mode', type=str, default="eval", choices=["eval", "finetune", "shadowllm"])
-    parser.add_argument('--model_load_path', type=str, default=None, help='Path to load model')
-    parser.add_argument('--model_resume_path', type=str, default=None, help='Path to resume training (includes optimizer, scheduler, and step states).')
-    parser.add_argument('--save_interval', type=int, default=200, help='Number of steps after which to save a checkpoint.')
 
-    # Current focus 
-    parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
-    parser.add_argument('--old_predictor', action='store_true', help='Old Predictor without proper LayerNorm implementations :(')
+    # Predictor Design Related Arguments
     parser.add_argument('--lookahead', type=int, default=0)
-    # Current focus 
     parser.add_argument('--sliding_window', type=int, default=None, help='Sliding window at eval IF comparing to SnapKV, set it to 16: Very Important!!!!!')
     parser.add_argument('--randomize_init', action='store_true', help='Very Experimental! Tries to train predictor on RANDOMLY initialized transformer...')
-    parser.add_argument('--test_with_thresholds', action='store_true', help='Test With Per-Head Token Thresholding, must have calibrated before!')
-    parser.add_argument('--gfac', type=int, default=1)
-    parser.add_argument('--immediate_train', action='store_true', help='Cosine without warmup for fast tests')
-    parser.add_argument('--ssmize_predictor', action='store_true', help='SSM instead of Attn in predictor')
-    parser.add_argument('--flash_attn', action='store_true', help='Use Flash Attention')
     parser.add_argument('--train_headpredictor', action='store_true', help='Train Head Predictor')
     parser.add_argument('--min_sparse_index', type=int, default=4, help="Num of Sink Tokens")
     parser.add_argument('--attn_reduce_factor', type=int, default=8, help="reduce factor for token predictor attention")
     parser.add_argument('--head_attn_reduce_factor', type=int, default=2, help="reduce factor for head predictor attention")
-    parser.add_argument('--pred_lr', type=float, default=1e-3, help='Predictor learning rate')
     parser.add_argument('--dDash', type=int, default=16, help='Attn Red-dim')
-    parser.add_argument('--skip_outlier', type=int, default=None, help='Skip backprop when task loss is outlier, stabilizes training. Not done on WK2, only RPJ.')
-
-    parser.add_argument('--no_pred_causal_mask', action='store_true', help='Enable or disable causal mask application')
-    parser.add_argument('--evalgap', type=int, default=200, help='eval gap during training')
-    parser.add_argument('--max_norm', type=int, default=20, help='Max Norm')
     parser.add_argument('--intdim', type=int, default=512, help='Int-Proc Dim')
-    parser.add_argument('--token_sparse_method', type=str, default="progressive_5pc", help="LazyLLM, progressive_xpc, fixed_xpc...")
-    parser.add_argument('--eval_llm_mode', type=str, default="TopSparse", help="oracle, lookahead_magnitude, lookahead_firstlayer_magnitude, predictor, h2o, streamingLLM")
-    # Not primay focus
-    parser.add_argument('--proj_name', type=str, default="AllContextual", help="Name for wandb project")
 
-    parser.add_argument('--eval_subset', type=int, default=None)
-    parser.add_argument('--train_subset_fac', type=int, default=None)
-    parser.add_argument('--rpj_train_seqlen', type=int, default=512)
-    parser.add_argument('--eval_wk2_seqlen', type=int, default=512)
-    parser.add_argument('--grad_accum_steps', type=int, default=1)
-
-    parser.add_argument('--producer_frequency', type=int, default=32, help="Gap of appearance for producer layer in model.")
-
-    parser.add_argument('--group_factor', type=int, default=4, help='Group factor for H2O, reduces acc, like Quest num_tok_per_page')
-    parser.add_argument('--num_tok_per_page', type=int, default=16, help='Number of tokens per page for Quest')
-    parser.add_argument('--stream_llm_start_size', type=int, default=4, help='Num-sink tokens to keep for StreamingLLM')
-
-    parser.add_argument('--lfunc', type=str, default="MSE", help="MSE, KLD,  JSD...")
-
-    parser.add_argument('--no_wandb', action='store_true', help='Enable or disable wandb logging')
-    parser.add_argument('--no_wikitext_eval', action='store_true', help='Whether to perform Wikitext evaluation.')
-    
-    parser.add_argument('--result_file', type=str, default="all_results.csv", help="Where to save results.")
-    parser.add_argument('--wname', type=str, default=None, help="Name for wandb run")
-    parser.add_argument('--model_parallelism', action='store_true', help='Enable model parallelism')
+    # Model-Mode (Config, Calibrate) related arguments
+    parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
+    parser.add_argument('--test_with_thresholds', action='store_true', help='Test With Per-Head Token Thresholding, must have calibrated before!')
     args = parser.parse_args()
-    args.do_wikitext_eval = not args.no_wikitext_eval
 
-    # dowandb is opposite of no_wandb
+
+    args.do_wikitext_eval = not args.no_wikitext_eval
     dowandb = not args.no_wandb
     torch.autograd.set_detect_anomaly(True)
     torch.manual_seed(args.seed)
@@ -962,9 +885,6 @@ if __name__ == '__main__':
     os.environ["PYTHONHASHSEED"] = str(args.seed)
 
     print("IF EVALUATING: To compare with SnapKV Fairly, please set --sliding_window to 16 for experiments.")
-    # if args.sliding_window is not None:
-    #     print("\n", "*"*50)
-    #     print("SLIDING WINDOW ONLY APPLIES TO BASELINE EVALUATIONS -- I.E., ONLY WHEN _baselines.py VARIANT IS IMPORTED.")
 
     if dowandb:
         if args.wname is not None:
@@ -973,13 +893,8 @@ if __name__ == '__main__':
             wandb.init(project=args.proj_name, config=args)
 
     model_path = args.model_path
-    channel_path = "config/" + model_path + ".json"
-    if "Yarn-Llama" in model_path or "Llama-2-7b-hf" in model_path or "longchat-7b" in model_path or "togetherco" in model_path:
-        channel_path = "config/" + "meta-llama/Llama-2-7b-hf" + ".json"
-
     testenc_wk2 = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
     if "70b" in model_path:
-        # TODO: support more than 8 x a10g
         device_map = {"model.embed_tokens": 0, "model.norm": 7, "lm_head": 7}
         for i in range(80):
             device_map[f"model.layers.{i}"] = i // 10
@@ -992,6 +907,7 @@ if __name__ == '__main__':
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_auth_token=True, use_fast=True, trust_remote_code=True)
     config = AutoConfig.from_pretrained(model_path, use_auth_token=True, trust_remote_code=True)
+    
     if args.model_parallelism:
         from transformers import AutoConfig
         device_cnt = torch.cuda.device_count()
@@ -1006,7 +922,6 @@ if __name__ == '__main__':
             device_map = {"model.embed_tokens": extra_param_device, "model.rotary_emb": extra_param_device, "model.norm": extra_param_device, "lm_head": extra_param_device}
             device_num_layers = config.num_hidden_layers // (device_cnt - 1)
             for i in range(config.num_hidden_layers):
-                # device_map[f"model.layers.{i}"] = (i // device_num_layers + 1) % device_cnt
                 device_map[f"model.layers.{i}"] = (i % (device_cnt - 1)) + 1
             device_map[f'model.layers.{0}'] = 0
         dtype = torch.float16 if args.model_mode == "eval" else torch.float32
@@ -1018,49 +933,27 @@ if __name__ == '__main__':
             use_auth_token=True,
             torch_dtype=dtype,
         )
-        # model.model.embed_tokens = model.model.embed_tokens.to('cuda:0')
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path, offload_folder=None, trust_remote_code=True, use_auth_token=True, **kwargs).cuda()
     if args.randomize_init:
-        # # reset parameters of model
-        # for module in model.modules():
-        #     if hasattr(module, "reset_parameters"):
-        #         module.reset_parameters()
-        #         import pdb; pdb.set_trace()
-        #         print("Resetting parameters for module: ", module.__class__.__name__)
-        # if hasattr(model, "reset_parameters"):
-        #     model.reset_parameters()
-        #     print("Resetting parameters for model: ", model.__class__.__name__)
         model = AutoModelForCausalLM.from_config(config).cuda()
 
-    # If config doesn't have an attribute num_hidden_layers
     if not hasattr(config, "num_hidden_layers"):
         args.producer_frequency = config.num_layers
     else:
         args.producer_frequency = config.num_hidden_layers
 
-    try:
-        with open(channel_path, "r") as f:
-            channel_config = json.load(f)
-    except:
-        print(f"Channel config not found at {channel_path}")
-        channel_config = None
 
     if args.architecture == "llama" and "Yarn-Llama" not in model_path:
         print("Running module replacement")
         if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
-            if args.ssmize_predictor:
-                raise NotImplementedError("SSMize deprecated for ExpPred. Ref to commit 053db60eaafac33611e86110f6110d8c8e4afe25 for implementation.")
-            else:
-                from modify_models.modify_llama import convert_kvcache_experimental, convert_llama_channel_config_experimental
-                from modify_models.modify_llama import LlamaAttentionExperimental
+            from modify_models.modify_llama import convert_kvcache_experimental
+            from modify_models.modify_llama import LlamaAttentionExperimental
         else:
-            from modify_models.modify_llama_baselines import convert_kvcache_experimental, convert_llama_channel_config_experimental
+            from modify_models.modify_llama_baselines import convert_kvcache_experimental
             from modify_models.modify_llama_baselines import LlamaAttentionExperimental
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency, args.heavy_const, args.group_factor, args.q_bits)
-        if channel_config is not None:
-            model = convert_llama_channel_config_experimental(model, channel_config, args.channel)
+        model = convert_kvcache_experimental(model, config, args.producer_frequency)
 
     elif args.architecture == "mistral":
         print("Running Mistral module replacement")
@@ -1069,7 +962,7 @@ if __name__ == '__main__':
         else:
             from modify_models.modify_mistral_baselines import convert_kvcache_experimental
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency, args.heavy_const, args.group_factor, args.q_bits)
+        model = convert_kvcache_experimental(model, config, args.producer_frequency)
     elif args.architecture == "mixtral":
         print("Running Mixtral module replacement")
         if args.eval_llm_mode == "ExpPred":
@@ -1077,7 +970,7 @@ if __name__ == '__main__':
         else:
             raise NotImplementedError("Baseline modes not implemented for Mixtral yet")
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency, args.heavy_const, args.group_factor, args.q_bits)
+        model = convert_kvcache_experimental(model, config, args.producer_frequency)
     elif args.architecture == "phi3":
         print("Running Phi3 module replacement")
         if args.eval_llm_mode == "ExpPred":
@@ -1085,7 +978,7 @@ if __name__ == '__main__':
         else:
             from modify_models.modify_phi3_baselines import convert_kvcache_experimental
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency, args.heavy_const, args.group_factor, args.q_bits)
+        model = convert_kvcache_experimental(model, config, args.producer_frequency)
     elif args.architecture == "glm":
         print("Running GLM module replacement")
         if args.eval_llm_mode == "ExpPred":
@@ -1093,7 +986,7 @@ if __name__ == '__main__':
         else:
             raise NotImplementedError("Baseline modes not implemented for GLM yet")
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency, args.heavy_const, args.group_factor, args.q_bits)
+        model = convert_kvcache_experimental(model, config, args.producer_frequency)
     elif args.architecture == "qwen":
         print("Running Qwen module replacement")
         if args.eval_llm_mode == "ExpPred":
@@ -1101,23 +994,19 @@ if __name__ == '__main__':
         else:
             raise NotImplementedError("Baseline modes not implemented for Qwen yet")
     
-        model = convert_kvcache_experimental(model, config, args.producer_frequency, args.heavy_const, args.group_factor, args.q_bits)
+        model = convert_kvcache_experimental(model, config, args.producer_frequency)
     else:
         raise NotImplementedError(f"Architecture {args.architecture} not supported")
 
     token_sparsity_list = []
     for module in model.modules():
-        # If module's class name ends with AttentionExperimental
         if module.__class__.__name__.endswith("AttentionExperimental"):
             module.eval_llm_mode = args.eval_llm_mode
-            module.gfac = args.gfac
             module.token_sparse_method = args.token_sparse_method
             module.set_token_sparsity()
             token_sparsity_list.append(1. - module.sparse_aggression)
             module.stream_llm_start_size = args.stream_llm_start_size
             module.num_tok_per_page = args.num_tok_per_page
-            module.group_factor = args.group_factor
-            module.lfunc = args.lfunc
             module.producer_frequency = args.producer_frequency
             module.dDash = args.dDash
             module.attn_reduce_factor = args.attn_reduce_factor
@@ -1127,19 +1016,25 @@ if __name__ == '__main__':
             module.train_headpredictor = args.train_headpredictor
             module.min_sparse_index = args.min_sparse_index
             module.lookahead = args.lookahead
-            module.old_predictor = args.old_predictor
-            module.num_layers_pred = module.producer_frequency  # Literally the gap is the number of layers to predict for.
+            module.num_layers_pred = module.producer_frequency
             module.sliding_window = args.sliding_window
 
             if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
                 if module.layer_idx % args.producer_frequency == 0:
                     module.update_predictor()
 
+    if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
+        model._prepare_cache_for_generation = patched_prepare_cache_for_generation.__get__(
+            model, model.__class__
+        )
+    else:
+        print("WARNING: We are not patching the DynamicCache.")
+
     try:
         print("\n\n\n Expected Sparsity For Method: ", sum(token_sparsity_list) / len(token_sparsity_list), "\n\n\n")
     except:
         pass
-        # import pdb; pdb.set_trace()
+
     if token_sparsity_list:
         avg_token_sparsity = sum(token_sparsity_list) / len(token_sparsity_list)
         args.net_sparsity = avg_token_sparsity
@@ -1153,7 +1048,10 @@ if __name__ == '__main__':
         producer_layer = get_producer_layers(model)[0]
 
         tokpred_params = sum(p.numel() for p in producer_layer.sparse_token_predictor.parameters())
-        head_pred_params = sum(p.numel() for p in producer_layer.sparse_head_predictor.parameters())
+        if args.train_headpredictor:
+            head_pred_params = sum(p.numel() for p in producer_layer.sparse_head_predictor.parameters())
+        else:
+            head_pred_params = 0
         total_params = tokpred_params + head_pred_params
         total_model_params = sum(p.numel() for p in model.parameters())
         spt_perc = tokpred_params / total_model_params * 100
@@ -1164,7 +1062,7 @@ if __name__ == '__main__':
         print("Total Predictor Param Count: ", total_params)
         print("Percentage Of Model Params in Token Predictor: ", spt_perc)
         print("Percentage Of Model Params in Head Predictor: ", hpt_perc)
-        # log token and head predictor parameters to wandb
+
         if dowandb:
             wandb.log({
                 "TokenPredictorParam": tokpred_params,
@@ -1175,15 +1073,14 @@ if __name__ == '__main__':
         pprint.pprint({name: {'params': sum(p.numel() for p in module.parameters()), 
                     'percentage': sum(p.numel() for p in module.parameters()) / total_params * 100} 
             for name, module in producer_layer.sparse_token_predictor.named_modules()})
-        
         print("="*10 + "Head Predictor" + "="*10)
+        if args.train_headpredictor:
+            pprint.pprint({name: {'params': sum(p.numel() for p in module.parameters()), 
+                        'percentage': sum(p.numel() for p in module.parameters()) / total_params * 100} 
+                for name, module in producer_layer.sparse_head_predictor.named_modules()})
+        else:
+            print("No Head Predictor")
 
-        pprint.pprint({name: {'params': sum(p.numel() for p in module.parameters()), 
-                    'percentage': sum(p.numel() for p in module.parameters()) / total_params * 100} 
-            for name, module in producer_layer.sparse_head_predictor.named_modules()})
-        # exit(0)
-        # exit(0)    
-        # In a new file, save the proj_name, tokpred_params, head_pred_params, total_params, total_model_params, spt, hpt
         targetfile = "paramratios.csv"
         if not os.path.exists(targetfile):
             with open(targetfile, mode='w') as file:
@@ -1266,8 +1163,7 @@ if __name__ == '__main__':
             args_dict = vars(args)
             header = list(args_dict.keys())
             header.append("perplexity")
-            header.extend(task_accuracies.keys())  # Add all task-specific keys
-            # header.extend([f"{task}_acc" for task in task_accuracies.keys()])
+            header.extend(task_accuracies.keys())
             if args.do_longbench_eval:
                 header.extend([f"{dataset}_longbench_score" for dataset in longbench_scores.keys()])
             results_writer.writerow(header)
@@ -1305,6 +1201,7 @@ if __name__ == '__main__':
 
         perplexity = 0
         if args.do_wikitext_eval:
+            perplexity, eval_mask = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=False, config=config)
             print(f"Perplexity on Wikitext-2: {perplexity:.2f}")
         if args.do_longbench_eval:
             longbench_results = run_long_bench_evaluation(model, tokenizer, args)
@@ -1335,9 +1232,8 @@ if __name__ == '__main__':
             results_writer = csv.writer(results_file)
             args_dict = vars(args)
             header = list(args_dict.keys())
-            header.append("perplexity")  # Add perplexity to the header
+            header.append("perplexity")
             header.extend(task_accuracies.keys())
-            # header.extend([f"{task}_acc" for task in task_accuracies.keys()])
             if args.do_longbench_eval:
                 header.extend([f"{dataset}_longbench_score" for dataset in longbench_scores.keys()])
             results_writer.writerow(header)
@@ -1347,9 +1243,6 @@ if __name__ == '__main__':
             if args.do_longbench_eval:
                 row.extend([longbench_scores[dataset] for dataset in longbench_scores.keys()])
             results_writer.writerow(row)
-
-    elif args.model_mode == "shadowllm":
-        raise NotImplementedError
     else:
         raise NotImplementedError
     

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 import gc
 
+from typing import Any, Dict, List, Optional, Tuple
 import traceback
 import torch
 from torch import nn
@@ -24,41 +25,240 @@ from transformers.cache_utils import DynamicCache
 from triton_kernels.flash_attn import attention
 from triton_kernels.flash_attn_mse_loss import attention_mse_loss
 
-# torch.backends.cuda.enable_flash_sdp(enabled=True)
-# torch.backends.cuda.enable_mem_efficient_sdp(enabled=True)
 
 class PredictorDynamicCache(DynamicCache):
     def __init__(self):
         super().__init__()
-        self.predictor_cache = None
-        self.head_predictor_cache = None  # Add this for Head Importance Predictor
-        self.h2o_importance = None
-    
-    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-        # First update the base cache
-        key_states, value_states = super().update(key_states, value_states, layer_idx)
-        return key_states, value_states
+        self.predictor_primary_key: List[Optional[torch.Tensor]] = []
+        self.predictor_primary_value: List[Optional[torch.Tensor]] = []
+        self.predictor_importance_key: List[Optional[torch.Tensor]] = []
 
-    def update_predictors(self, predictor_cache, head_predictor_cache=None):
-        self.predictor_cache = predictor_cache
-        self.head_predictor_cache = head_predictor_cache
+    def update_predictor_primary(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Append or create the predictor's "primary" K/V states for `layer_idx`.
 
-    def get_predictor_cache(self):
-        return self.predictor_cache
-    
-    def get_head_predictor_cache(self):
-        return self.head_predictor_cache
-    
-    def update_h2o_importance(self, h2o_importance):
-        self.h2o_importance = h2o_importance
-    
-    def get_h2o_importance(self):
-        return self.h2o_importance
+        shape for key_states, value_states is typically [batch_size, num_heads, seq_len, head_dim].
+        """
+        # Extend the lists so that `predictor_primary_key[layer_idx]` and
+        # `predictor_primary_value[layer_idx]` exist.
+        self._ensure_list_capacity(
+            self.predictor_primary_key, layer_idx, fill=None
+        )
+        self._ensure_list_capacity(
+            self.predictor_primary_value, layer_idx, fill=None
+        )
+
+        # If this is the very first time we are updating that layer's predictor cache, just assign
+        if self.predictor_primary_key[layer_idx] is None:
+            self.predictor_primary_key[layer_idx] = key_states
+            self.predictor_primary_value[layer_idx] = value_states
+        else:
+            # Otherwise, concatenate along the seq_len dimension (=-2 or =2 depending on your shape).
+            self.predictor_primary_key[layer_idx] = torch.cat(
+                [self.predictor_primary_key[layer_idx], key_states], dim=2
+            )
+            self.predictor_primary_value[layer_idx] = torch.cat(
+                [self.predictor_primary_value[layer_idx], value_states], dim=2
+            )
+
+        return (
+            self.predictor_primary_key[layer_idx],
+            self.predictor_primary_value[layer_idx],
+        )
+
+    def update_predictor_importance(
+        self,
+        key_states: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """
+        Append or create the predictor's "importance" key for `layer_idx`.
+        """
+        self._ensure_list_capacity(
+            self.predictor_importance_key, layer_idx, fill=None
+        )
+
+        if self.predictor_importance_key[layer_idx] is None:
+            self.predictor_importance_key[layer_idx] = key_states
+        else:
+            self.predictor_importance_key[layer_idx] = torch.cat(
+                [self.predictor_importance_key[layer_idx], key_states], dim=2
+            )
+        return self.predictor_importance_key[layer_idx]
+
+    def crop(self, max_length: int):
+        super().crop(max_length)
+        # Now also crop predictor caches
+        for idx in range(len(self.predictor_primary_key)):
+            if self.predictor_primary_key[idx] is not None:
+                self.predictor_primary_key[idx] = self.predictor_primary_key[idx][..., :max_length, :]
+                self.predictor_primary_value[idx] = self.predictor_primary_value[idx][..., :max_length, :]
+
+        for idx in range(len(self.predictor_importance_key)):
+            if self.predictor_importance_key[idx] is not None:
+                self.predictor_importance_key[idx] = self.predictor_importance_key[idx][..., :max_length, :]
+
+        # Remember to adjust self._seen_tokens accordingly
+        self._seen_tokens = min(self._seen_tokens, max_length)
+
+    def batch_split(
+        self, full_batch_size: int, split_size: int, num_hidden_layers: int = None
+    ) -> List["PredictorDynamicCache"]:
+        # Use the base split logic for the standard K/V
+        base_splits = super().batch_split(full_batch_size, split_size, num_hidden_layers)
+        # `base_splits` is now a list of new DynamicCache objects. But we *actually*
+        # want them to be PredictorDynamicCache so we can store the predictor states.
+        # Easiest: we can cast and fill them. 
+        out: List[PredictorDynamicCache] = []
+
+        for split_i, base_split in enumerate(base_splits):
+            # Construct an empty PredictorDynamicCache
+            new_cache = PredictorDynamicCache()
+            # Copy over the underlying fields from base_split
+            new_cache.key_cache = base_split.key_cache
+            new_cache.value_cache = base_split.value_cache
+            new_cache._seen_tokens = base_split._seen_tokens
+
+            # Now also slice our predictor fields
+            # The slice in batch dim is [i:i+split_size].
+            b_start = split_i * split_size
+            b_end = min(full_batch_size, b_start + split_size)
+
+            new_cache.predictor_primary_key = self._slice_list_tensors(
+                self.predictor_primary_key, b_start, b_end
+            )
+            new_cache.predictor_primary_value = self._slice_list_tensors(
+                self.predictor_primary_value, b_start, b_end
+            )
+            new_cache.predictor_importance_key = self._slice_list_tensors(
+                self.predictor_importance_key, b_start, b_end
+            )
+
+            out.append(new_cache)
+
+        return out
+
+    @classmethod
+    def from_batch_splits(cls, splits: List["PredictorDynamicCache"], num_hidden_layers: int = None) -> "PredictorDynamicCache":
+        # Let the base class handle the normal K/V merges
+        base_merged = DynamicCache.from_batch_splits(splits, num_hidden_layers=num_hidden_layers)
+        merged = cls()
+        merged.key_cache = base_merged.key_cache
+        merged.value_cache = base_merged.value_cache
+        merged._seen_tokens = base_merged._seen_tokens
+
+        # Now unify predictor states by concatenating along batch dim=0
+        merged.predictor_primary_key = cls._merge_list_tensors(
+            [split.predictor_primary_key for split in splits]
+        )
+        merged.predictor_primary_value = cls._merge_list_tensors(
+            [split.predictor_primary_value for split in splits]
+        )
+        merged.predictor_importance_key = cls._merge_list_tensors(
+            [split.predictor_importance_key for split in splits]
+        )
+
+        return merged
+
+    def batch_repeat_interleave(self, repeats: int):
+        super().batch_repeat_interleave(repeats)
+        self.predictor_primary_key = self._repeat_list_tensors(
+            self.predictor_primary_key, repeats
+        )
+        self.predictor_primary_value = self._repeat_list_tensors(
+            self.predictor_primary_value, repeats
+        )
+        self.predictor_importance_key = self._repeat_list_tensors(
+            self.predictor_importance_key, repeats
+        )
+
+    def batch_select_indices(self, indices: torch.Tensor):
+        super().batch_select_indices(indices)
+        self.predictor_primary_key = self._select_list_tensors(
+            self.predictor_primary_key, indices
+        )
+        self.predictor_primary_value = self._select_list_tensors(
+            self.predictor_primary_value, indices
+        )
+        self.predictor_importance_key = self._select_list_tensors(
+            self.predictor_importance_key, indices
+        )
+
+    @staticmethod
+    def _ensure_list_capacity(lst: list, idx: int, fill=None):
+        if len(lst) <= idx:
+            lst.extend([fill] * (idx + 1 - len(lst)))
+
+    @staticmethod
+    def _slice_list_tensors(
+        tensor_list: List[Optional[torch.Tensor]], start: int, end: int
+    ) -> List[Optional[torch.Tensor]]:
+        out = []
+        for t in tensor_list:
+            if t is None:
+                out.append(None)
+            else:
+                out.append(t[start:end, ...])
+        return out
+
+    @classmethod
+    def _merge_list_tensors(
+        cls, list_of_lists: List[List[Optional[torch.Tensor]]]
+    ) -> List[Optional[torch.Tensor]]:
+        # If no splits, return empty
+        if not list_of_lists:
+            return []
+
+        # Number of layers is length of the sub-list from the first split
+        max_len = len(list_of_lists[0])
+        merged = [None] * max_len
+
+        for layer_idx in range(max_len):
+            # collect that layer_idx from each split
+            chunk_tensors = []
+            for split in list_of_lists:
+                t = split[layer_idx] if layer_idx < len(split) else None
+                if t is not None:
+                    chunk_tensors.append(t)
+            if len(chunk_tensors) == 0:
+                merged[layer_idx] = None
+            else:
+                merged[layer_idx] = torch.cat(chunk_tensors, dim=0)
+        return merged
+
+    @staticmethod
+    def _repeat_list_tensors(
+        tensor_list: List[Optional[torch.Tensor]], repeats: int
+    ) -> List[Optional[torch.Tensor]]:
+        out = []
+        for t in tensor_list:
+            if t is None:
+                out.append(None)
+            else:
+                out.append(t.repeat_interleave(repeats, dim=0))
+        return out
+
+    @staticmethod
+    def _select_list_tensors(
+        tensor_list: List[Optional[torch.Tensor]], indices: torch.Tensor
+    ) -> List[Optional[torch.Tensor]]:
+        out = []
+        for t in tensor_list:
+            if t is None:
+                out.append(None)
+            else:
+                out.append(t.index_select(0, indices))
+        return out
 
 
 class TokenImportancePredictorAttentive(nn.Module):
     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
-                 attn_reduce_factor, old_predictor=True, dropout=0.1):
+                 attn_reduce_factor, dropout=0.1):
         """
         Optimized Token Importance Predictor with parallel Q-K projections and simplified mapping.
         
@@ -84,7 +284,6 @@ class TokenImportancePredictorAttentive(nn.Module):
         self.attn_reduce_factor = attn_reduce_factor
         self.max_position_embeddings = config.max_position_embeddings
         self.flash_attn = False
-        self.old_predictor = old_predictor
         assert pred_hid_size % (num_heads * 4) == 0, "pred_hid_size must be divisible by num_heads * 4."
 
         # Reduce the hidden size for attention computations
@@ -115,8 +314,7 @@ class TokenImportancePredictorAttentive(nn.Module):
             nn.Dropout(self.dropout)
         )
         # Add extra LayerNorm for the importance branch when not using the old design.
-        if not self.old_predictor:
-            self.norm_importance = nn.LayerNorm(self.hidden_size)
+        self.norm_importance = nn.LayerNorm(self.hidden_size)
 
         # Define Q and K projection layers for all layers in parallel with non-linearity[]
         # Output shape: [B, L, N * H * D']
@@ -180,7 +378,7 @@ class TokenImportancePredictorAttentive(nn.Module):
             config_copy
         )
 
-    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, use_cache=False):
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, use_cache=False, layer_idx=None):
         """
         Forward pass for the Optimized Token Importance Predictor.
         
@@ -194,17 +392,15 @@ class TokenImportancePredictorAttentive(nn.Module):
         Returns:
             torch.Tensor: Importance scores of shape [B, N, H, L, L].
         """
+        layer_idx = 0 # Guaranteed to be 0, as we only have one predictor!
+
         # Set device if not already set
         if self.device != hidden_states.device:
             self.device = hidden_states.device
             self.to(self.device)
             
         B, L, E = hidden_states.size()
-        if past_key_value is None:
-            past_key_value = {}
-        # if L == 1:
-        #     import pdb; pdb.set_trace()
-        past_primary = past_key_value.get('primary', None)
+        
         # Reduce hidden size
         hidden_states = hidden_states.to(self.input_proj.weight.dtype)
         hidden_states_reduced = self.input_proj(hidden_states)  # [B, L, hidden_size_reduced]
@@ -216,100 +412,72 @@ class TokenImportancePredictorAttentive(nn.Module):
         q = q.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
         k = k.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
         v = v.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
-        # Compute kv_seq_len before concatenation
-        if past_primary is not None:
-            past_L = past_primary[0].shape[2]
-            kv_seq_len = past_L + L
+        if (past_key_value is not None
+            and layer_idx < len(past_key_value.predictor_primary_key)
+            and past_key_value.predictor_primary_key[layer_idx] is not None):
+            offset = past_key_value.predictor_primary_key[layer_idx].shape[2]  # old_k.shape[2]
         else:
-            kv_seq_len = L
-        
-        # Apply rotary positional embeddings based on kv_seq_len
-        cos, sin = self.rotary_emb_attn(v, position_ids)
-        
-        if position_ids is None:
-            position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=self.device)
-            position_ids = position_ids.unsqueeze(0).expand(B, kv_seq_len)
-        
-        if past_primary is not None:
-            # Concatenate past k and v
-            k = torch.cat([past_primary[0], k], dim=2)  # [B, num_heads, past_L + L, attn_head_dim]
-            v = torch.cat([past_primary[1], v], dim=2)  # [B, num_heads, past_L + L, attn_head_dim]
-        
-        # Apply rotary embeddings after concatenation
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-        
-        # Update cache if use_cache is True
-        if use_cache:
-            past_key_value['primary'] = (k.detach(), v.detach())
+            offset = 0
 
-        # if self.flash_attn:
-        #     sm_scale = 1.0 / math.sqrt(self.attn_head_dim)
-        #     attn_output = attention(q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16), True, sm_scale).to(q.dtype)
-        # else:
-        #     attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        # total seq length for new + old
+        kv_seq_len = offset + L
+
+        # Step 2: build position_ids for just the new chunk [offset..offset+L-1]
+        if position_ids is None:
+            # shape [B, L], e.g. [0..(offset+L-1)]
+            position_ids = torch.arange(offset, offset + L, dtype=torch.long, device=self.device)
+            position_ids = position_ids.unsqueeze(0).expand(B, L)
+
+        # Step 3: apply rotary to just the new chunk k,v with the correct offset
+        cos, sin = self.rotary_emb_attn(v, position_ids)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+
+        # Step 4: ask the cache to append them.  Then re‐assign k, v to the full cat
+        if use_cache and past_key_value is not None:
+            k, v = past_key_value.update_predictor_primary(k.detach(), v.detach(), layer_idx)
+            kv_seq_len = k.size(2)  # now includes old + new
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         attn_output = attn_output.to(q.dtype)
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced)
         attn_output = self.norm1(attn_output)
         ffn_output = self.ffn(attn_output)
         # Temporary measure, till old predictor fully deprecated
-        if not self.old_predictor:
-            hidden_states = self.norm2(hidden_states + ffn_output)
-        else:
-            hidden_states = hidden_states + ffn_output
+        hidden_states = self.norm2(hidden_states + ffn_output)
 
         B, L, E = hidden_states.size()
         # Importance projections
         H = self.num_heads
         N = self.num_hidden_layers
 
-        # Temporary measure, till old predictor fully deprecated
-        if not self.old_predictor:
-            hidden_states_for_importance = self.norm_importance(hidden_states)
-        else:
-            hidden_states_for_importance = hidden_states
+        hidden_states_for_importance = self.norm_importance(hidden_states)
         q_importance = self.q_proj_importance(hidden_states_for_importance)
         k_importance = self.k_proj_importance(hidden_states_for_importance)
-        # # Shape after projection: [B, L, N * H * D']
-        # q_importance = self.q_proj_importance(hidden_states)  # [B, L, N * H * D']
-        # k_importance = self.k_proj_importance(hidden_states)  # [B, L, N * H * D']
 
         # Reshape and permute to [B, N, H, L, D']
         q_importance = q_importance.view(B, L, N, H, self.dDash).permute(0, 2, 3, 1, 4).contiguous()  # [B, N, H, L, D']
         k_importance = k_importance.view(B, L, N, H, self.dDash).permute(0, 2, 3, 1, 4).contiguous()  # [B, N, H, L, D']
 
         # Flatten N and H for efficient computation
-        # New shape: [B * N * H, L, D']
         q_importance = q_importance.view(B * N * H, L, self.dDash)  # [BNH, L, D']
         k_importance = k_importance.view(B * N * H, L, self.dDash)  # [BNH, L, D']
-
-        # Retrieve past keys and values for importance attention
-        past_importance = past_key_value.get('importance', None)
-
-        # Concatenate past keys and values if cache is present
-        if past_importance is not None:
-            k_importance = torch.cat([past_importance['k'], k_importance], dim=1)  # [BNH, past_L + L, D']
-        kv_seq_len = k_importance.size(1)
 
         # Apply rotary positional embeddings
         cos, sin = self.rotary_emb_importance(k_importance, position_ids)
         q_importance, k_importance = apply_rotary_pos_emb(q_importance, k_importance, cos, sin, position_ids)
 
-        k_importance = k_importance.view(B * N * H, -1, self.dDash)  # [BNH, L, D']
-        # Update cache if use_cache is True
-        if use_cache:
-            past_key_value['importance'] = {
-                'k': k_importance.detach(),
-            }
-        q_importance = q_importance.view(B * H, N, L, self.dDash)  # [BH, N, L, D']
-        k_importance = k_importance.view(B * H, N, kv_seq_len, self.dDash)  # [BH, N, L, D']
-        return q_importance, k_importance, past_key_value
+        if use_cache and past_key_value is not None:
+            k_importance = past_key_value.update_predictor_importance(k_importance.detach(), layer_idx)
+            
+        k_importance = k_importance.view(B * H, N, -1, self.dDash)  # [BNH, L, D']
+        q_importance = q_importance.view(B * H, N, -1, self.dDash)  # [BH, N, L, D']
+        return q_importance, k_importance
 
 
 
 class HeadImportancePredictor(nn.Module):
     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
-                 attn_reduce_factor, old_predictor=True, dropout=0.1):
+                 attn_reduce_factor, dropout=0.1):
         """
         Optimized Token Importance Predictor with parallel Q-K projections and simplified mapping.
         
@@ -336,7 +504,6 @@ class HeadImportancePredictor(nn.Module):
         self.attn_reduce_factor = attn_reduce_factor
         self.max_position_embeddings = config.max_position_embeddings
         self.flash_attn = False
-        self.old_predictor = old_predictor
 
         # Reduce the hidden size for attention computations
         self.hidden_size_reduced = self.hidden_size // self.attn_reduce_factor  # For example, reduce to 1/4th

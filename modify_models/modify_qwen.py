@@ -89,19 +89,6 @@ class Qwen2AttentionExperimental(nn.Module):
                 intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor
             ).to('cuda:0')
             self.sparse_head_predictor.flash_attn = self.flash_attn
-        else:
-            # initialize very small model to keep in-memory for seq-len 2048
-            self.sparse_head_predictor = HeadImportancePredictor(
-                self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = 4, \
-                intdim = 16, attn_reduce_factor=(self.pred_hid_size // self.num_heads)
-            ).to('cuda:0')
-            # Dont use flash-attention if head-prediction is in pseudo mdoe.
-            # self.sparse_head_predictor.flash_attn = False
-
-
-    def set_head_sparsity(self, head_sparsity_aggression, global_prune):
-        self.head_sparsity_aggression = head_sparsity_aggression
-        self.head_global_prune = global_prune
 
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
@@ -157,12 +144,6 @@ class Qwen2AttentionExperimental(nn.Module):
             self.k_importance = None
             self.head_importances = None
         
-        past_key_value_sp = None if past_key_value is None else past_key_value.get_predictor_cache()
-        past_key_value_hp = None if past_key_value is None else past_key_value.get_head_predictor_cache()
-
-        # if past_key_value_sp is not None:
-        #     print("Past Key Value Sparsity:", past_key_value_sp)
-
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -181,8 +162,6 @@ class Qwen2AttentionExperimental(nn.Module):
         
         if use_cache:
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-            # key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            # value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         kv_seq_len = key_states.shape[-2]
         final_mask = None
@@ -193,17 +172,18 @@ class Qwen2AttentionExperimental(nn.Module):
         key_len = key_states.size(2)
         bsz, q_len = query_states.size(0), query_states.size(2)
 
-        # Ahmed Modification. Always set an attention_mask
-        # Create causal mask if attention_mask is None
+
         if attention_mask is None:
-            # Create causal mask
-            # [bsz, 1, q_len, kv_seq_len]
-            # @Ahmed -- this should be corrected for decode.
-            causal_mask = torch.ones((bsz, 1, q_len, kv_seq_len), device=hidden_states.device, dtype=torch.bool)
-            causal_mask = causal_mask.triu(diagonal=1)  # Upper triangular part
-            attention_mask = torch.zeros_like(causal_mask, dtype=hidden_states.dtype)
-            attention_mask.masked_fill_(causal_mask, float("-inf"))
-        assert self.head_dim % self.group_factor == 0
+            # We want a [q_len, kv_seq_len] boolean upper-triangular mask
+            causal_mask_2d = torch.ones(q_len, kv_seq_len, 
+                                        device=hidden_states.device, 
+                                        dtype=torch.bool).triu(diagonal=1)
+            # Then shape it to [bsz, 1, q_len, kv_seq_len]
+            causal_mask_4d = causal_mask_2d.unsqueeze(0).expand(bsz, 1, q_len, kv_seq_len)
+            # Now fill -inf where the mask is True
+            attention_mask = torch.full_like(causal_mask_4d, 0, dtype=hidden_states.dtype)
+            attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
+
         if self.inference_mode:
             min_sparse_index = self.min_sparse_index
             with torch.no_grad():
@@ -284,10 +264,6 @@ class Qwen2AttentionExperimental(nn.Module):
                     else:
                         raise ValueError(f"NaN loss detected: {mse_loss}")
                 else:
-                    # attn_output = attention(query_states.contiguous().to(torch.float16), 
-                    #                         key_states.contiguous().to(torch.float16),
-                    #                         value_states.contiguous().to(torch.float16), True, 1.0 / math.sqrt(self.head_dim))
-                    # attn_output = attn_output.to(query_states.dtype)
                     attn_output = torch.nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=None, is_causal=True)
             else:
                 attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)   
@@ -297,30 +273,21 @@ class Qwen2AttentionExperimental(nn.Module):
                     importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
                     importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
 
-                    if self.lfunc == "MSE":
-                        if self.lookahead == 0:
-                            self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
-                        else:
-                            import pdb; pdb.set_trace()
-                            self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
-                        # self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
-                        self.msemagn_loss = (self.msemagn_loss).mean(dim=(-1, -2))
-                        self.msemagn_loss = self.msemagn_loss.mean()
-
-                        if self.calc_hitrates:
-                            self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
-                                estimated_importance=importance_mask,
-                                true_importance=attn_weights,
-                                top_k_ratio=0.5
-                            )
-
+                    if self.lookahead == 0:
+                        self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
                     else:
-                        raise ValueError(f"Unknown loss function {self.lfunc}")
-                if attention_mask is not None:
-                    if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                        raise ValueError(
-                            f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                        self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
+                    self.msemagn_loss = (self.msemagn_loss).mean(dim=(-1, -2))
+                    self.msemagn_loss = self.msemagn_loss.mean()
+
+                    if self.calc_hitrates:
+                        self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
+                            estimated_importance=importance_mask,
+                            true_importance=attn_weights,
+                            top_k_ratio=0.5
                         )
+
+                if attention_mask is not None:
                     attn_weights = attn_weights + attention_mask
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
                 attn_output = torch.matmul(attn_weights, value_states)
@@ -363,12 +330,13 @@ class Qwen2AttentionExperimental(nn.Module):
 
         if self.producer is None:
             try:
-                q_importance, k_importance, past_key_value_sp = self.sparse_token_predictor(
-                    hidden_states, 
-                    attention_mask=attention_mask, 
-                    position_ids=position_ids, 
-                    past_key_value=past_key_value_sp, 
-                    use_cache=use_cache
+                q_importance, k_importance = self.sparse_token_predictor(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,  # the same single cache
+                    use_cache=use_cache,
+                    layer_idx=self.layer_idx,       # or pass 0
                 )
                 if self.train_headpredictor:
                     head_importances, past_key_value_hp = self.sparse_head_predictor(
@@ -393,19 +361,12 @@ class Qwen2AttentionExperimental(nn.Module):
                     self.head_importances = head_importances
                 else:
                     self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
-
-
-
-        if use_cache:
-            if self.producer is None: # This is the producer layer
-                past_key_value.update_predictors(past_key_value_sp, past_key_value_hp)
-
+        
         if not output_attentions:
             attn_weights = None
-
         return attn_output, attn_weights
 
-def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
+def convert_kvcache_experimental(model, config, producer_frequency):
     producer_layer = None
     producer_layer_device = None
     layer_counter = {'idx': 0}
@@ -430,9 +391,6 @@ def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=
                         layer_idx=layer_counter['idx']
                     ).to(dtype).to(device)
                 new_module.load_state_dict(module.state_dict(), strict=False)
-                new_module.heavy_const = heavy_const
-                new_module.group_factor = group_factor
-                new_module.label_bits = label_bits
                 is_producer = layer_counter['idx'] % producer_frequency == 0
                 if is_producer:
                     print(f"Converted Producer layer '{name}' to Qwen2AttentionExperimental at layer index {layer_counter['idx']}")

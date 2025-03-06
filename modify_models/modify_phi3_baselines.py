@@ -21,21 +21,6 @@ from utils import repeat_kv, sorted_index_to_mask, SlidingWindowCache, enforce_s
 from utils import calculate_hit_metrics
 from transformers.cache_utils import DynamicCache
 
-class BaselineDynamicCache(DynamicCache):
-    def __init__(self):
-        super().__init__()
-        self.h2o_importance = None
-    
-    def update(self, key_states, value_states, layer_idx):
-        # First update the base cache
-        key_states, value_states = super().update(key_states, value_states, layer_idx)
-        return key_states, value_states
-
-    def update_h2o_importance(self, h2o_importance):
-        self.h2o_importance = h2o_importance
-    
-    def get_h2o_importance(self):
-        return self.h2o_importance
 
 
 class Phi3AttentionExperimental(nn.Module):
@@ -149,12 +134,12 @@ class Phi3AttentionExperimental(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Union[DynamicCache, BaselineDynamicCache]] = None,
+        past_key_value = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         padding_mask: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Union[DynamicCache, BaselineDynamicCache]]]:
+    ):
         bsz, q_len, _ = hidden_states.size()
         # convert hidden_states to same dtype as self.q_proj.weight
         # hidden_states = hidden_states.to(self.q_proj.weight.dtype)
@@ -186,10 +171,6 @@ class Phi3AttentionExperimental(nn.Module):
         evalmode = self.eval_llm_mode
         num_tokens_to_keep = int(q_len * self.sparse_aggression)
 
-        if past_key_value is not None:
-            h2o_importance_history = past_key_value.get_h2o_importance()
-        else:
-            h2o_importance_history = None
         # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)  # AHMED: Modified this to use the newer version.
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
@@ -219,7 +200,6 @@ class Phi3AttentionExperimental(nn.Module):
             attention_mask.masked_fill_(causal_mask, float("-inf"))
 
 
-        assert self.head_dim % self.group_factor == 0
         attn_o_precalc = False
         min_sparse_index = self.min_sparse_index
         with torch.no_grad():
@@ -273,29 +253,6 @@ class Phi3AttentionExperimental(nn.Module):
                     sorted_indices = ll_six.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_heads, key_len, key_len).to(query_states.device)
                     sorted_indices = sorted_indices[:, :, -q_len:, :]
                     mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, None)
-                    attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-                    final_mask = mask_tensor
-                    attn_weights = attn_weights + mask_tensor + attention_mask
-                else:
-                    attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            elif evalmode == "oracle_grouped":
-                # **This buckets in the embedding dimension, quest buckets in the token dimension**
-                if self.layer_idx > 0:
-                    grouped_query = query_states.reshape(bsz, self.num_heads, q_len, self.head_dim // self.group_factor, self.group_factor).sum(dim=-1) / self.group_factor
-                    grouped_key = key_states.reshape(bsz, self.num_heads, kv_seq_len, self.head_dim // self.group_factor, self.group_factor).sum(dim=-1) / self.group_factor
-                    # Materializes full [B H L L], but compute is reduced.
-                    grouped_attn_weights = torch.matmul(grouped_query, grouped_key.transpose(2, 3)) / math.sqrt(self.head_dim // self.group_factor)
-                    grouped_attn_weights = torch.softmax(grouped_attn_weights + attention_mask, dim=-1, dtype=torch.float32)
-                    _, sorted_indices = grouped_attn_weights.sort(dim=-1, descending=True)
-                    sorted_indices = sorted_indices[:, :, -q_len:, :]
-                    mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
-                    if self.sliding_window is not None:
-                        if not hasattr(self, "window_cache"):
-                            self.window_cache = SlidingWindowCache(max_seq_len=1024,
-                                                                sliding_window=self.sliding_window,
-                                                                device=mask_tensor.device)
-                        window = self.window_cache.get_window(q_len, key_len)
-                        mask_tensor = enforce_sliding_window(mask_tensor, window)
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                     final_mask = mask_tensor
                     attn_weights = attn_weights + mask_tensor + attention_mask
@@ -449,133 +406,57 @@ class Phi3AttentionExperimental(nn.Module):
                     final_mask = final_mask.view(combined_bh, q_len, kv_seq_len)
                     # Determine maximum kv_cache_budget
                     max_budget = max(int(key_len * self.sparse_aggression), min_sparse_index)
-                    
-                    # If q_len == 1, this is a decode step (adding one token at a time)
-                    if q_len == 1 and h2o_importance_history is not None:
-                        # Load existing active_tokens and active_counts
-                        prev_active_tokens, prev_active_counts = h2o_importance_history
-                        # if prev_active_tokens.size(-1) is smaller than max_budget,
-                        # make it bigger 
-                        if prev_active_tokens.size(-1) <= max_budget:
-                            prev_active_tokens = torch.cat(
-                                [prev_active_tokens, torch.full_like(prev_active_tokens, 0)], dim=-1
-                            )[..., :max_budget + 1]
+                
+                    # This is the prefill scenario: we process the entire q_len at once.
+                    # We'll run the original logic to figure out active_tokens for all steps.
+                    final_mask = torch.full_like(attn_weights, float('-inf'))
+                    final_mask_2d = final_mask.view(combined_bh, q_len, kv_seq_len)
+                    attn_weights_2d = attn_weights.view(combined_bh, q_len, kv_seq_len)
 
-                        # prev_active_tokens: [combined_bh, max_budget]
-                        # prev_active_counts: [combined_bh]
+                    active_tokens = torch.full((combined_bh, max_budget), 0, dtype=torch.long, device=attn_weights.device)
+                    active_tokens[:, 0] = 0
+                    active_counts = torch.ones(combined_bh, dtype=torch.long, device=attn_weights.device)
 
-                        # Let's say total_tokens_so_far = stored_key.size(2) + q_len
-                        total_tokens_so_far = kv_seq_len
-                        new_token_id = total_tokens_so_far - 1
+                    final_mask_2d[:, 0, 0] = 0.0
 
-                        # Current row weights up to new_token_id
-                        # For q_len==1, i=0 is the new token. 
-                        # Since q_len=1 means just one query position, attn_weights shape: [B,H,1,kv_seq_len]
-                        # Let's flatten for easier indexing:
-                        attn_weights_2d = attn_weights.view(combined_bh, 1, kv_seq_len)
-                        row_weights = attn_weights_2d[:, 0, :new_token_id+1]  # [combined_bh, new_token_id+1]
-
+                    for i in range(1, q_len):
                         kv_cache_budget = torch.full((combined_bh,),
-                                                    max(min_sparse_index, int((new_token_id + 1) * self.sparse_aggression)),
+                                                    max(min_sparse_index, int((i + 1 - self.sliding_window - min_sparse_index) * self.sparse_aggression)),
                                                     device=attn_weights.device)
-
-                        can_add = prev_active_counts < kv_cache_budget
+                        row_weights = attn_weights_2d[:, i, :i + 1]
+                        can_add = active_counts < kv_cache_budget
                         add_indices = can_add.nonzero(as_tuple=False).squeeze(-1)
-
-                        # if self.layer_idx == 1:
-                        #     import pdb; pdb.set_trace()
-                        prev_active_tokens[add_indices, prev_active_counts[add_indices] - 1] = new_token_id
-                        prev_active_counts[add_indices] += 1
+                        active_tokens[add_indices, active_counts[add_indices]] = i
+                        active_counts[add_indices] += 1
 
                         cannot_add = ~can_add
                         if cannot_add.any():
                             replace_indices = cannot_add.nonzero(as_tuple=False).squeeze(-1)
                             max_k = kv_cache_budget[replace_indices].max().item()
-                            current_active = prev_active_tokens[replace_indices, :max_k]
+                            current_active = active_tokens[replace_indices, :max_k]
                             active_importances = row_weights[replace_indices].gather(1, current_active)
                             min_vals, min_idxs = torch.min(active_importances, dim=1, keepdim=True)
-                            new_importance = row_weights[replace_indices, new_token_id].unsqueeze(1)
+                            new_importance = row_weights[replace_indices, i].unsqueeze(1)
                             should_replace = new_importance > min_vals
                             rows_to_replace = replace_indices[should_replace.squeeze(1)]
                             pos_to_replace = min_idxs[should_replace.squeeze(1)].squeeze(1)
-                            prev_active_tokens[rows_to_replace, pos_to_replace] = new_token_id
+                            active_tokens[rows_to_replace, pos_to_replace] = i
 
-
-                        # Construct final_mask for this single step
-                        final_mask = torch.full_like(attn_weights, float('-inf'))
-                        final_mask = final_mask.view(combined_bh, 1, kv_seq_len)
-                        valid_positions = torch.arange(max_budget, device=attn_weights.device).unsqueeze(0) < prev_active_counts.unsqueeze(1)
+                        valid_positions = torch.arange(max_budget, device=attn_weights.device).unsqueeze(0) < active_counts.unsqueeze(1)
                         valid_rows = valid_positions.nonzero(as_tuple=True)[0]
                         valid_token_positions = valid_positions.nonzero(as_tuple=True)[1]
-                        valid_tokens = prev_active_tokens[valid_rows, valid_token_positions]
-                        final_mask[valid_rows, 0, valid_tokens] = 0.0
-                        final_mask = final_mask.view(bsz, num_heads, 1, kv_seq_len)
-                        if self.sliding_window is not None:
-                            if not hasattr(self, "window_cache"):
-                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
-                                                                    sliding_window=self.sliding_window,
-                                                                    device=final_mask.device)
-                            window = self.window_cache.get_window(q_len, key_len)
-                            final_mask = enforce_sliding_window(final_mask, window)
+                        valid_tokens = active_tokens[valid_rows, valid_token_positions]
+                        final_mask_2d[valid_rows, i, valid_tokens] = 0.0
 
-                        attn_weights = attn_weights + final_mask
-
-                        # Update h2o_importance_history with the latest active_tokens and counts
-                        h2o_importance_history = (prev_active_tokens, prev_active_counts)
-
-                    else:
-                        # This is the prefill scenario: we process the entire q_len at once.
-                        # We'll run the original logic to figure out active_tokens for all steps.
-                        final_mask = torch.full_like(attn_weights, float('-inf'))
-                        final_mask_2d = final_mask.view(combined_bh, q_len, kv_seq_len)
-                        attn_weights_2d = attn_weights.view(combined_bh, q_len, kv_seq_len)
-
-                        active_tokens = torch.full((combined_bh, max_budget), 0, dtype=torch.long, device=attn_weights.device)
-                        active_tokens[:, 0] = 0
-                        active_counts = torch.ones(combined_bh, dtype=torch.long, device=attn_weights.device)
-
-                        final_mask_2d[:, 0, 0] = 0.0
-
-                        for i in range(1, q_len):
-                            kv_cache_budget = torch.full((combined_bh,),
-                                                        max(min_sparse_index, int((i + 1 - self.sliding_window - min_sparse_index) * self.sparse_aggression)),
-                                                        device=attn_weights.device)
-                            row_weights = attn_weights_2d[:, i, :i + 1]
-                            can_add = active_counts < kv_cache_budget
-                            add_indices = can_add.nonzero(as_tuple=False).squeeze(-1)
-                            active_tokens[add_indices, active_counts[add_indices]] = i
-                            active_counts[add_indices] += 1
-
-                            cannot_add = ~can_add
-                            if cannot_add.any():
-                                replace_indices = cannot_add.nonzero(as_tuple=False).squeeze(-1)
-                                max_k = kv_cache_budget[replace_indices].max().item()
-                                current_active = active_tokens[replace_indices, :max_k]
-                                active_importances = row_weights[replace_indices].gather(1, current_active)
-                                min_vals, min_idxs = torch.min(active_importances, dim=1, keepdim=True)
-                                new_importance = row_weights[replace_indices, i].unsqueeze(1)
-                                should_replace = new_importance > min_vals
-                                rows_to_replace = replace_indices[should_replace.squeeze(1)]
-                                pos_to_replace = min_idxs[should_replace.squeeze(1)].squeeze(1)
-                                active_tokens[rows_to_replace, pos_to_replace] = i
-
-                            valid_positions = torch.arange(max_budget, device=attn_weights.device).unsqueeze(0) < active_counts.unsqueeze(1)
-                            valid_rows = valid_positions.nonzero(as_tuple=True)[0]
-                            valid_token_positions = valid_positions.nonzero(as_tuple=True)[1]
-                            valid_tokens = active_tokens[valid_rows, valid_token_positions]
-                            final_mask_2d[valid_rows, i, valid_tokens] = 0.0
-
-                        final_mask = final_mask_2d.view(bsz, num_heads, q_len, kv_seq_len)
-                        if self.sliding_window is not None:
-                            if not hasattr(self, "window_cache"):
-                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
-                                                                    sliding_window=self.sliding_window,
-                                                                    device=final_mask.device)
-                            window = self.window_cache.get_window(q_len, key_len)
-                            final_mask = enforce_sliding_window(final_mask, window)
-                        attn_weights = attn_weights + final_mask
-                        # After processing full q_len (prefill), store active_tokens and active_counts into h2o_importance_history
-                        h2o_importance_history = (active_tokens, active_counts)
+                    final_mask = final_mask_2d.view(bsz, num_heads, q_len, kv_seq_len)
+                    if self.sliding_window is not None:
+                        if not hasattr(self, "window_cache"):
+                            self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                sliding_window=self.sliding_window,
+                                                                device=final_mask.device)
+                        window = self.window_cache.get_window(q_len, key_len)
+                        final_mask = enforce_sliding_window(final_mask, window)
+                    attn_weights = attn_weights + final_mask
                 else:
                     attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
@@ -685,7 +566,7 @@ class Phi3AttentionExperimental(nn.Module):
 
         if use_cache:
             if evalmode == "h2o_true":
-                past_key_value.update_h2o_importance(h2o_importance_history)
+                raise NotImplementedError("Cache not implemented for h2o_true")
         else:
             past_key_value = None
 
@@ -699,7 +580,7 @@ class Phi3AttentionExperimental(nn.Module):
         
         return attn_output, attn_weights, past_key_value
 
-def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
+def convert_kvcache_experimental(model, config, producer_frequency):
     producer_layer = None
     layer_counter = {'idx': 0}
 
@@ -721,9 +602,6 @@ def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=
                         layer_idx=layer_counter['idx']
                     ).to(dtype).to(device)
                 new_module.load_state_dict(module.state_dict(), strict=False)
-                new_module.heavy_const = heavy_const
-                new_module.group_factor = group_factor
-                new_module.label_bits = label_bits
                 is_producer = layer_counter['idx'] % producer_frequency == 0
                 if is_producer:
                     print(f"Converted Producer layer '{name}' to Phi3AttentionExperimental at layer index {layer_counter['idx']}")
