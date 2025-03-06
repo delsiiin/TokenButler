@@ -788,7 +788,6 @@ attention_mse_loss = _attention_mse_loss.apply
 from torch import nn
 from torch.nn import MSELoss
 import time
-# from torchviz import make_dot
 if __name__ == '__main__':
     B, H, N_CTX, D = 1, 32, 512, 128
     D_DASH = 32

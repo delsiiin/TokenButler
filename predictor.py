@@ -34,7 +34,7 @@ class PredictorDynamicCache(DynamicCache):
         self.head_predictor_cache = None  # Add this for Head Importance Predictor
         self.h2o_importance = None
     
-    def update(self, key_states, value_states, layer_idx):
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         # First update the base cache
         key_states, value_states = super().update(key_states, value_states, layer_idx)
         return key_states, value_states
@@ -58,7 +58,7 @@ class PredictorDynamicCache(DynamicCache):
 
 class TokenImportancePredictorAttentive(nn.Module):
     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
-                 attn_reduce_factor, old_predictor, dropout=0.1):
+                 attn_reduce_factor, old_predictor=True, dropout=0.1):
         """
         Optimized Token Importance Predictor with parallel Q-K projections and simplified mapping.
         
@@ -168,7 +168,7 @@ class TokenImportancePredictorAttentive(nn.Module):
             "rope_type": "llama3"
         }
         config_copy.head_dim = self.attn_head_dim
-
+        
         # Rotary embedding for attention layer
         self.rotary_emb_attn = LlamaRotaryEmbedding(
             config_copy
@@ -242,11 +242,12 @@ class TokenImportancePredictorAttentive(nn.Module):
         if use_cache:
             past_key_value['primary'] = (k.detach(), v.detach())
 
-        if self.flash_attn:
-            sm_scale = 1.0 / math.sqrt(self.attn_head_dim)
-            attn_output = attention(q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16), True, sm_scale).to(q.dtype)
-        else:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        # if self.flash_attn:
+        #     sm_scale = 1.0 / math.sqrt(self.attn_head_dim)
+        #     attn_output = attention(q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16), True, sm_scale).to(q.dtype)
+        # else:
+        #     attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         attn_output = attn_output.to(q.dtype)
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced)
         attn_output = self.norm1(attn_output)
@@ -308,7 +309,7 @@ class TokenImportancePredictorAttentive(nn.Module):
 
 class HeadImportancePredictor(nn.Module):
     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
-                 attn_reduce_factor, old_predictor, dropout=0.1):
+                 attn_reduce_factor, old_predictor=True, dropout=0.1):
         """
         Optimized Token Importance Predictor with parallel Q-K projections and simplified mapping.
         
@@ -390,13 +391,15 @@ class HeadImportancePredictor(nn.Module):
                     nn.init.constant_(module.out_proj.bias, 0)
 
     def _init_rope(self):
+        config_copy = copy.deepcopy(self.config)
+        config_copy.head_dim = self.attn_head_dim
         # Rotary embedding for attention layer
         self.rotary_emb_attn = LlamaRotaryEmbedding(
-            self.config
+            config_copy
         )
         # Rotary embedding for importance projection
         self.rotary_emb_importance = LlamaRotaryEmbedding(
-            self.config
+            config_copy
         )
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, use_cache=False):
@@ -444,7 +447,6 @@ class HeadImportancePredictor(nn.Module):
         
         # Apply rotary positional embeddings based on kv_seq_len
         cos, sin = self.rotary_emb_attn(v, position_ids)
-        
         if position_ids is None:
             position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=self.device)
             position_ids = position_ids.unsqueeze(0).expand(B, kv_seq_len)
@@ -461,11 +463,12 @@ class HeadImportancePredictor(nn.Module):
         if use_cache:
             past_key_value['primary'] = (k.detach(), v.detach())
 
-        if self.flash_attn:
-            sm_scale = 1.0 / math.sqrt(self.attn_head_dim)
-            attn_output = attention(q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16), True, sm_scale).to(q.dtype)
-        else:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        # if self.flash_attn:
+        #     sm_scale = 1.0 / math.sqrt(self.attn_head_dim)
+        #     attn_output = attention(q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16), True, sm_scale).to(q.dtype)
+        # else:
+        #     attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         attn_output = attn_output.to(q.dtype)
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced)
         attn_output = self.norm1(attn_output)

@@ -53,6 +53,7 @@ class Qwen2AttentionExperimental(nn.Module):
         self.num_tok_per_page = None
         self.calc_hitrates = False
         self.flash_attn = False
+        self.train_headpredictor = False
 
         if self.layer_idx > 0:
             self.mseloss = MSELoss(reduction='none')
@@ -80,20 +81,20 @@ class Qwen2AttentionExperimental(nn.Module):
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
             self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
             intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor
-        )
+        ).to('cuda:0')
         self.sparse_token_predictor.flash_attn = self.flash_attn
         if self.train_headpredictor:
             self.sparse_head_predictor = HeadImportancePredictor(
                 self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
                 intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor
-            )
+            ).to('cuda:0')
             self.sparse_head_predictor.flash_attn = self.flash_attn
         else:
             # initialize very small model to keep in-memory for seq-len 2048
             self.sparse_head_predictor = HeadImportancePredictor(
                 self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = 4, \
                 intdim = 16, attn_reduce_factor=(self.pred_hid_size // self.num_heads)
-            )
+            ).to('cuda:0')
             # Dont use flash-attention if head-prediction is in pseudo mdoe.
             # self.sparse_head_predictor.flash_attn = False
 
@@ -208,8 +209,8 @@ class Qwen2AttentionExperimental(nn.Module):
             with torch.no_grad():
                 if evalmode == "ExpPred":
                     if self.layer_idx > 0:
-                        q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float() # [BH, Lq, D']
-                        k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float() # [BH, Lk, D']
+                        q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
+                        k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
                         importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
                         importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -262,18 +263,20 @@ class Qwen2AttentionExperimental(nn.Module):
                 if self.layer_idx > 0:
                     # Token hit-rates cannot be calculated if using flash attention.
                     self.tok_hit_acc = 0
-                    q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float() # [BH, Lq, D']
-                    k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float() # [BH, Lk, D']
+                    q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
+                    k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
                     q_importance_tensor = q_importance_tensor.view(bsz, self.num_heads, q_len, self.dDash)
                     k_importance_tensor = k_importance_tensor.view(bsz, self.num_heads, key_len, self.dDash)
                     assert self.lookahead == 0, "Lookahead not supported with flash attention yet. Please disable --flash_attn"
-                    attn_output, mse_loss = attention_mse_loss(query_states.contiguous().to(torch.float16),
-                                                                key_states.contiguous().to(torch.float16),
-                                                                value_states.contiguous().to(torch.float16),
-                                                                q_importance_tensor.contiguous().to(torch.float16),
-                                                                k_importance_tensor.contiguous().to(torch.float16), 
-                                                                True
-                                                                )
+                    device_index = query_states.device.index
+                    with torch.cuda.device(device_index):
+                        attn_output, mse_loss = attention_mse_loss(query_states.contiguous().to(torch.float16),
+                                                                    key_states.contiguous().to(torch.float16),
+                                                                    value_states.contiguous().to(torch.float16),
+                                                                    q_importance_tensor.contiguous().to(torch.float16),
+                                                                    k_importance_tensor.contiguous().to(torch.float16), 
+                                                                    True
+                                                                    )
                     self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = 0, 0, 0
                     attn_output = attn_output.to(query_states.dtype)
                     if not torch.isnan(mse_loss):
@@ -281,15 +284,16 @@ class Qwen2AttentionExperimental(nn.Module):
                     else:
                         raise ValueError(f"NaN loss detected: {mse_loss}")
                 else:
-                    attn_output = attention(query_states.contiguous().to(torch.float16), 
-                                            key_states.contiguous().to(torch.float16),
-                                            value_states.contiguous().to(torch.float16), True, 1.0 / math.sqrt(self.head_dim))
-                    attn_output = attn_output.to(query_states.dtype)
+                    # attn_output = attention(query_states.contiguous().to(torch.float16), 
+                    #                         key_states.contiguous().to(torch.float16),
+                    #                         value_states.contiguous().to(torch.float16), True, 1.0 / math.sqrt(self.head_dim))
+                    # attn_output = attn_output.to(query_states.dtype)
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=None, is_causal=True)
             else:
                 attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)   
                 if self.layer_idx > 0:
-                    q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float() # [BH, Lq, D']
-                    k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float() # [BH, Lk, D']
+                    q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
+                    k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
                     importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
                     importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
 
@@ -322,7 +326,7 @@ class Qwen2AttentionExperimental(nn.Module):
                 attn_output = torch.matmul(attn_weights, value_states)
 
         if self.layer_idx > 0 and self.train_headpredictor:
-            head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency].float()
+            head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency].float().to(attn_output.device)
             attn_head_weights = attn_output.mean(dim=-1).permute(0, 2, 1)
             self.headmsemagn_loss = self.headmseloss(attn_head_weights, head_importance_tensor).mean()
 
@@ -403,10 +407,12 @@ class Qwen2AttentionExperimental(nn.Module):
 
 def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
     producer_layer = None
+    producer_layer_device = None
     layer_counter = {'idx': 0}
 
     def recurse_convert(parent_module):
         nonlocal producer_layer
+        nonlocal producer_layer_device
         for name, module in parent_module._modules.items():
             if len(list(module.children())) > 0:
                 recurse_convert(module)
@@ -416,6 +422,7 @@ def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=
                 if layer_counter['idx'] % producer_frequency == 0:
                     new_module = Qwen2AttentionExperimental(config).to(dtype).to(device)
                     producer_layer = new_module
+                    producer_layer_device = device
                 else:
                     new_module = Qwen2AttentionExperimental(
                         config,
@@ -434,4 +441,5 @@ def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=
                 parent_module._modules[name] = new_module
                 layer_counter['idx'] += 1
     recurse_convert(model)
+    producer_layer = producer_layer.to(producer_layer_device)
     return model
