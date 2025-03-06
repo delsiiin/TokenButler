@@ -55,6 +55,10 @@ class Phi3AttentionExperimental(nn.Module):
         self.flash_attn = False
         self.original_max_position_embeddings = config.original_max_position_embeddings
         self.rope_scaling = config.rope_scaling
+        self.train_headpredictor = False
+        self.calibrate_thresholds = False
+        self.test_with_thresholds = False
+        self.old_predictor = None
 
         if self.layer_idx > 0:
             self.mseloss = MSELoss(reduction='none')
@@ -88,20 +92,20 @@ class Phi3AttentionExperimental(nn.Module):
     def update_predictor(self):
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
             self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-            intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor
+            intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor, old_predictor=self.old_predictor
         ).to('cuda:0')
         self.sparse_token_predictor.flash_attn = self.flash_attn
         if self.train_headpredictor:
             self.sparse_head_predictor = HeadImportancePredictor(
                 self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor
+                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor, old_predictor=self.old_predictor
             ).to('cuda:0')
             self.sparse_head_predictor.flash_attn = self.flash_attn
         else:
             # initialize very small model to keep in-memory for seq-len 2048
             self.sparse_head_predictor = HeadImportancePredictor(
                 self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = 4, \
-                intdim = 16, attn_reduce_factor=(self.pred_hid_size // self.num_heads)
+                intdim = 16, attn_reduce_factor=(self.pred_hid_size // self.num_heads), old_predictor=self.old_predictor
             ).to('cuda:0')
             # Dont use flash-attention if head-prediction is in pseudo mdoe.
             # self.sparse_head_predictor.flash_attn = False

@@ -399,13 +399,18 @@ class LlamaAttentionExperimental(nn.Module):
                         active_counts = torch.ones(combined_bh, dtype=torch.long, device=attn_weights.device)
 
                         final_mask_2d[:, 0, 0] = 0.0
-                        obs_size = 16
+                        # obs_size = 16
+                        # obs_size = 4
+                        if self.sliding_window is not None:
+                            obs_size = self.sliding_window
+                        else:
+                            obs_size = 4
                         
                         for i in range(1, q_len):
                             # step_budget = max(int((i + 1 - obs_size) * self.sparse_aggression), min_sparse_index)
                             # Either no step budget, or a step budget that increases linearly with query index
                             # Sliding window and anchor is guaranteed, so we msut subtract from budget
-                            step_budget = max(int((i + 1 - obs_size - min_sparse_index) * self.sparse_aggression), 0)
+                            step_budget = max(int((i + 1 - obs_size - min_sparse_index) * self.sparse_aggression), 1)
                             # step_budget = max(int((i + 1) * self.sparse_aggression), min_sparse_index)
                             # step_budget = max_budget
                             obs_start = max(0, i - obs_size + 1)
@@ -437,21 +442,24 @@ class LlamaAttentionExperimental(nn.Module):
                             active_counts[add_indices] += 1
 
                             cannot_add = ~can_add
-                            # If any heads have exceeded budget, we need to replace tokens
-                            if cannot_add.any():
-                                replace_indices = cannot_add.nonzero(as_tuple=False).squeeze(-1)
-                                # get active tokens for budget excess
-                                current_active = active_tokens[replace_indices, :step_budget]
-                                # Get their pooled importances
-                                row_imps = aggregator_pooled[replace_indices].gather(1, current_active)
-                                # find least important token
-                                min_vals, min_idxs = torch.min(row_imps, dim=1, keepdim=True)
-                                # replace if new token is more important
-                                new_imps = new_token_importance[replace_indices]
-                                should_replace = new_imps > min_vals
-                                rows_to_replace = replace_indices[should_replace.squeeze(1)]
-                                pos_to_replace = min_idxs[should_replace.squeeze(1)].squeeze(1)
-                                active_tokens[rows_to_replace, pos_to_replace] = i
+                            try:
+                                # If any heads have exceeded budget, we need to replace tokens
+                                if cannot_add.any():
+                                    replace_indices = cannot_add.nonzero(as_tuple=False).squeeze(-1)
+                                    # get active tokens for budget excess
+                                    current_active = active_tokens[replace_indices, :step_budget]
+                                    # Get their pooled importances
+                                    row_imps = aggregator_pooled[replace_indices].gather(1, current_active)
+                                    # find least important token
+                                    min_vals, min_idxs = torch.min(row_imps, dim=1, keepdim=True)
+                                    # replace if new token is more important
+                                    new_imps = new_token_importance[replace_indices]
+                                    should_replace = new_imps > min_vals
+                                    rows_to_replace = replace_indices[should_replace.squeeze(1)]
+                                    pos_to_replace = min_idxs[should_replace.squeeze(1)].squeeze(1)
+                                    active_tokens[rows_to_replace, pos_to_replace] = i
+                            except:
+                                import pdb; pdb.set_trace()
 
                             # Initialize mask for that 'query index'
                             final_mask_2d[:, i, :] = float('-inf')

@@ -353,7 +353,12 @@ class Phi3AttentionExperimental(nn.Module):
                         active_counts = torch.ones(combined_bh, dtype=torch.long, device=attn_weights.device)
 
                         final_mask_2d[:, 0, 0] = 0.0
-                        obs_size = 16
+                        # obs_size = 16
+                        # obs_size = 4
+                        if self.sliding_window is not None:
+                            obs_size = self.sliding_window
+                        else:
+                            obs_size = 4
                         
                         for i in range(1, q_len):
                             step_budget = max(int((i + 1 - obs_size - min_sparse_index) * self.sparse_aggression), 0)
