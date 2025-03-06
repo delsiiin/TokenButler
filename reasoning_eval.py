@@ -2,6 +2,7 @@ import json
 import tqdm
 import torch
 from torch import nn
+from predictor import PredictorDynamicCache
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, LlamaForCausalLM, AutoConfig
 from datasets import load_dataset
 from functools import partial
@@ -30,12 +31,11 @@ from transformers.optimization import get_cosine_schedule_with_warmup
 
 from huggingface_hub import login
 
-from utils import FlattenedDataset, plot_thresholds
+from utils import FlattenedDataset, plot_thresholds, sanitize_filename, args_to_name
 
 ### New imports
 from longbench_utils import scorer, MODEL2MAXLEN, DATASET2PROMPT, DATASET2MAXLEN
 from datasets import load_from_disk
-# from datasets import set_seed
 
 from torch.utils.data import DataLoader
 from scipy.stats import kendalltau, spearmanr
@@ -47,36 +47,15 @@ import re
 scaler = GradScaler('cuda', enabled=True)
 global dowandb
 dotenv.load_dotenv()
-hftoken = os.getenv("HFTOKEN")
-# login(token=hftoken)
+try:
+    hftoken = os.getenv("HFTOKEN")
+    login(token=hftoken)
+except:
+    print("Warning: HF-Login may be needed!")
+    pass
 
 torch.backends.cuda.enable_flash_sdp(True)
 
-def sanitize_filename(name):
-    return re.sub(r'[<>:"/\\|?*\'\[\]]', '_', name)
-
-def args_to_name(args, timestamp=True):
-    args_dict = vars(args)
-    args_dict = args_dict.copy()
-    # remove longbench_datasets, task_list from args_dict
-    args_dict.pop("longbench_datasets", None)
-    args_dict.pop("task_list", None)
-    model_descr = list(args_dict.values())
-    # Split the model description into two parts
-    split_point = len(model_descr) // 2
-    folder_part = model_descr[:split_point]
-    file_part = model_descr[split_point:]
-    # Create a sanitized folder name from the first part
-    folder_name = "_".join([str(elem) for elem in folder_part])
-    folder_name = sanitize_filename(folder_name)
-    # Create a sanitized file name from the second part
-    file_name = "_".join([str(elem) for elem in file_part])
-    file_name = sanitize_filename(file_name)
-    # Add timestamp to file name
-    if timestamp:
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        file_name = file_name + "_" + timestamp
-    return folder_name, file_name
 
 def save_model(args, model, note=None):
     if note is None:
@@ -253,7 +232,6 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
         prompt = prompt_format.format(**json_obj)
         # Truncate to fit max_length
         tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-        
         if len(tokenized_prompt) > max_length:
             half = int(max_length / 2)
             prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) + tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
@@ -264,10 +242,11 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
         
         input_ids = tokenizer(prompt, truncation=False, return_tensors="pt")
         context_length = input_ids.input_ids.shape[-1]
+        embed_device = model.model.embed_tokens.weight.device
         with autocast():
             if dataset == "samsum":
                 output = model.generate(
-                    **input_ids.to(device),
+                    **input_ids.to(embed_device),
                     max_new_tokens=max_gen,
                     num_beams=1,
                     do_sample=False,
@@ -277,7 +256,7 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
                 )[0].to("cpu")
             else:
                 output = model.generate(
-                    **input_ids.to(device),
+                    **input_ids.to(embed_device),
                     max_new_tokens=max_gen,
                     num_beams=1,
                     do_sample=False,
@@ -289,12 +268,37 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
         preds.append({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj.get("all_classes", None), "length": json_obj.get("length", None)})
     return preds
 
+
 def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_list=["arc_easy", "hellaswag"], limit=None, flash_attn=False, train_headpredictor=False):
+
+    if args.model_parallelism:
+        model_producer_layers = get_producer_layers(model)
+        for producer_layer in model_producer_layers:
+            for param in producer_layer.sparse_token_predictor.parameters():
+                param = param.to('cuda:0')
+        for name, param in model.named_parameters():
+            print(f"Layer: {name}, Device: {param.device}")
+            
     for module in model.modules():
         # Here, we should take care to set head predictor flash attention mode appropriately
         module.flash_attn = False
     model.seqlen = max_length
     lm_obj = HFLM(pretrained=model, tokenizer=tokenizer, add_bos_token=False, batch_size=batch_size)
+
+
+    # Get the original forward method
+    original_forward = lm_obj.model.forward
+
+    # Define a patched forward method
+    def patched_forward(*args, **kwargs):
+        kwargs["past_key_values"] = PredictorDynamicCache()
+
+        # Call the original forward method
+        return original_forward(*args, **kwargs)
+
+    # Apply the patch
+    lm_obj.model.forward = patched_forward
+
     task_manager = lm_eval.tasks.TaskManager()
     print(f"Evaluating on tasks: {task_list}")
     # autocast
@@ -305,7 +309,7 @@ def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_l
                 tasks=task_list,
                 task_manager=task_manager,
                 log_samples=False,
-                limit=limit
+                limit=limit,
             )
     res = make_table(results)
     print(res)
@@ -316,282 +320,158 @@ def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_l
                 module.flash_attn = False
     return results['results']
 
-def investigate_custom_sentences(model, tokenizer, args, testenc=None, traintime_subset=False):
+def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=False, config=None):
+    """
+    Evaluates the model on the Wikitext-2 dataset using perplexity.
+
+    Args:
+        model: The neural network model.
+        tokenizer: The tokenizer corresponding to the model.
+        args: Arguments containing configuration details (e.g., eval_subset, eval_wk2_seqlen).
+        traintime_subset (bool): Whether to use a smaller subset for evaluation.
+
+    Returns:
+        The perplexity of the model on the test dataset.
+    """
     model.eval()
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+
+    # Use a subset of data if traintime_subset or args.eval_subset is specified
+    try:
+        if traintime_subset:
+            dataset = dataset.select(range(1000))
+        elif args.eval_subset is not None:
+            dataset = dataset.select(range(args.eval_subset))
+    except:
+        pass
+    # dataset = dataset.select(range(100)) # Temporary, for snapKV fast-eval on downstream.
+    # Concatenate all text entries
+    concatenated_text = "\n\n".join(dataset["text"])
+    tokenized_output = tokenizer(concatenated_text, truncation=False)
+
+    # Split tokenized input into chunks of max_seq_len
+    input_ids = torch.tensor(tokenized_output["input_ids"]).to(model.device)
+    max_seq_len = args.eval_wk2_seqlen
+    num_chunks = (len(input_ids) + max_seq_len - 1) // max_seq_len  # Ceiling division
+    input_chunks = input_ids.split(max_seq_len)
+
     for module in model.modules():
         if module.__class__.__name__.endswith("AttentionExperimental"):
-            module.calc_hitrates = False
+            module.calc_hitrates = True
             module.calibrate_thresholds = args.calibrate_thresholds
             module.test_with_thresholds = args.test_with_thresholds
 
-    # from base_sentences import location_list, profile_generation_sentences
-    from base_sentences import generate_profile_sentences
-    location_list, profile_generation_sentences = generate_profile_sentences(num_generations = 10)
-
-    def find_subsequence_indices(haystack, needle):
-        matches = []
-        hay_len = len(haystack)
-        ndl_len = len(needle)
-        if ndl_len == 0:
-            return matches
-        for start_idx in range(hay_len - ndl_len + 1):
-            if haystack[start_idx : start_idx + ndl_len] == needle:
-                matches.append(list(range(start_idx, start_idx + ndl_len)))
-        return matches
-
     loss_fn = CrossEntropyLoss()
-    total_loss, total_tokens = 0.0, 0
+    total_loss = 0.0
+    total_tokens = 0
+    progress_bar = tqdm.tqdm(range(num_chunks), desc="Evaluating Wikitext-2")
+    losses = []
+    avg_tok_hit_rate = []
+    avg_head_hit_rate = []
+    threshold_mean = []
+    true_threshmean = []
+    effective_sparsity_list = [] 
 
-    all_investigations = []
-
-    keys = list(profile_generation_sentences.keys())
-    progress_bar = tqdm.tqdm(keys, desc="Evaluating custom sentences")
-
-    for idx in progress_bar:
-        sentence = profile_generation_sentences[idx]
-        tokenized = tokenizer(sentence, return_tensors='pt')
-        input_ids = tokenized["input_ids"].to(model.device)     # shape [1, seq_len]
-        print("Sequence Length: ", input_ids.shape)
-        attention_mask = tokenized["attention_mask"].to(model.device)
-
-        if input_ids.size(1) < 2:
+    for chunk in progress_bar:
+        batch = input_chunks[chunk].unsqueeze(0).to(model.device)
+        if batch.size(1) < 2:  # Skip sequences too short for meaningful evaluation
             continue
+        with autocast():
+            with torch.no_grad():
+                outputs = model(batch, use_cache=False)
+                logits = outputs.logits[:, :-1, :]
+                target = batch[:, 1:]
 
-        with autocast(), torch.no_grad():
-            outputs = model(input_ids, attention_mask=attention_mask, use_cache=False)
-            logits = outputs.logits[:, :-1, :]
-            targets = input_ids[:, 1:]
-            loss = loss_fn(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-            total_loss += loss.item() * targets.numel()
-            total_tokens += targets.numel()
-
-        # Prepare debugging data for this sentence
-        chunk_data = {
-            "sentence": sentence,
-            "tokens": {},
-            "predicted_tokens": {},
-            "incorrect_indices": [],
-            "final_mask_allheads": [],
-            "location_token_idxs": [],
-        }
-
-        seq_len = input_ids.size(1)
-        for i in range(seq_len):
-            chunk_data["tokens"][i] = tokenizer.decode([input_ids[0, i]])
-
-        predicted = logits.argmax(dim=-1)  # shape [1, seq_len-1]
-        for i in range(predicted.size(1)):
-            pred_id = predicted[0, i].item()
-            chunk_data["predicted_tokens"][i+1] = tokenizer.decode([pred_id])
-            if pred_id != targets[0, i].item():
-                chunk_data["incorrect_indices"].append(i+1)
-        chunk_data["predicted_sentence"] = ''.join(list(chunk_data["predicted_tokens"].values()))
-
-        for mod in model.modules():
-            if mod.__class__.__name__.endswith("AttentionExperimental"):
-                if hasattr(mod, "final_mask_investigate") and mod.final_mask_investigate is not None:
-                    fm = mod.final_mask_investigate
-                    chunk_data["final_mask_allheads"].append(fm.detach().cpu())
-
-        if idx < len(location_list):
-            location_str = location_list[idx]
-            location_tokens = tokenizer(location_str, add_special_tokens=False)["input_ids"]
-            haystack = input_ids[0].tolist()
-            found_indices = find_subsequence_indices(haystack, location_tokens)
-            if len(found_indices) == 0:
-                location_tokens = tokenizer(" " + location_str, add_special_tokens=False)["input_ids"]
-                haystack = input_ids[0].tolist()
-                found_indices = find_subsequence_indices(haystack, location_tokens)
-            print(haystack[:20], location_tokens, found_indices)
-            chunk_data["location_token_idxs"] = found_indices
-
-        all_investigations.append(chunk_data)
-
-    # Post-process all_investigations
-    for data in tqdm.tqdm(all_investigations, desc="Post-processing custom sentences"):
-        loc_tokens_all = data["location_token_idxs"]
-        if not loc_tokens_all:
-            data["location_miss"] = None
-            data["location_inaccuracy"] = None
-            data["tok_preserved"] = None
-            continue
-
-        # Check last location token indices
-        last_loc_tokens = loc_tokens_all[-1]
-        incorrect_indices = data["incorrect_indices"]
-        data["location_miss"] = any(tok in incorrect_indices for tok in last_loc_tokens)
-        data["location_inaccuracy"] = 100*float(sum(tok in incorrect_indices for tok in last_loc_tokens) / len(last_loc_tokens))
-
-        # Compute preservation times for tokens
-        fm = data["final_mask_allheads"]
-        if fm is None:
-            data["tok_preserved"] = None
-            continue
-
-        fm_bool = [x.bool().cpu() for x in fm]
-        batch_idx = 0
-        num_heads = fm_bool[0].shape[1]
-        currmask = fm_bool[0][0][0]
-        # make sns heatmap and save it
-        plt.figure(figsize=(9, 3))
-        sns.heatmap(currmask.cpu().numpy(), cmap=sns.color_palette("light:b", as_cmap=True), cbar=False, xticklabels=False, yticklabels=False)
-        plt.axis('off')  # Remove axes
-        plt.tight_layout(pad=0)  # Maximize heatmap
-        plt.savefig(f"mask2_{args.eval_llm_mode}.png", bbox_inches='tight', pad_inches=0)
+                loss = loss_fn(logits.view(-1, logits.size(-1)), target.view(-1))
+                total_loss += loss.item() * target.numel()
+                losses.append(loss.item())
+                total_tokens += target.numel()
+            tok_hit_rates, tok_mean_rank_corr, tok_max_rank_corr = [], [], []
+            head_hit_rates, head_mean_rank_corr, head_max_rank_corr = [], [], []
+            layeridx = 0
+            for module in model.modules():
+                if module.__class__.__name__.endswith("AttentionExperimental") and module.layer_idx != 0:
+                    try:
+                        tok_hit_rates.append(module.tok_hit_acc)
+                        tok_mean_rank_corr.append(module.tok_mean_rank_corr)
+                        tok_max_rank_corr.append(module.tok_max_rank_corr)
+                        head_hit_rates.append(module.head_hit_acc)
+                        head_mean_rank_corr.append(module.head_mean_rank_corr)
+                        head_max_rank_corr.append(module.head_max_rank_corr)
+                        ### Threshold variance investigation
+                        if hasattr(module, 'threshmean'):
+                            threshold_mean.append(module.threshmean.cpu().detach())
+                            true_threshmean.append(module.true_threshmean.cpu().detach())
+                        if hasattr(module, 'effective_sparsity'):
+                            effective_sparsity_list.append(module.effective_sparsity)
+                        ### Threshold variance investigation
+                        layeridx += 1
+                    except:
+                        layeridx += 1
+                        continue
+            tok_hit_rates = torch.tensor(tok_hit_rates).mean().item()
+            tok_mean_rank_corr = torch.tensor(tok_mean_rank_corr).mean().item()
+            tok_max_rank_corr = torch.tensor(tok_max_rank_corr).mean().item()
+            try:
+                head_hit_rates = torch.tensor(head_hit_rates).mean().item()
+                head_mean_rank_corr = torch.tensor(head_mean_rank_corr).mean().item()
+                head_max_rank_corr = torch.tensor(head_max_rank_corr).mean().item()
+            except:
+                head_hit_rates = 0
+                head_mean_rank_corr = 0
+                head_max_rank_corr = 0
+            avg_tok_hit_rate.append(tok_hit_rates)
+            avg_head_hit_rate.append(head_hit_rates)
+    # Compute perplexity
+    avg_loss = total_loss / total_tokens
+    perplexity = torch.exp(torch.tensor(avg_loss))
+    print(f"Perplexity evaluation completed: {perplexity.item()}")
+    print(f"Average Token Hit Rate: {100*sum(avg_tok_hit_rate) / len(avg_tok_hit_rate)}%")
+    print(f"Average Head Hit Rate: {100*sum(avg_head_hit_rate) / len(avg_head_hit_rate)}%")
+    model_name = args.model_path.split("/")[-1]
+    ### Threshold variance investigation
+    if args.calibrate_thresholds:
+        # Get number of layers in model
+        nlayers = config.num_hidden_layers
+        nheads = config.num_attention_heads
+        threshold_tensor = torch.stack([x for x in threshold_mean if x.size(-1)==1024]).view(-1, nlayers - 1, nheads, 1024)
+        true_threshold_tensor = torch.stack([x for x in true_threshmean if x.size(-1)==1024]).view(-1, nlayers - 1, nheads, 1024)
+        mean_threshold_postattn, mean_threshold_predpresm = plot_thresholds(threshold_tensor, true_threshold_tensor, model_name, args.token_sparse_method)
+        # We can save the mean_threshold_predpresm
+        # The reference to the dict should be named as model name and sparsity target
+        # check if a directory called threshold_calibs exists
+        if not os.path.exists("threshold_calibs"):
+            os.makedirs("threshold_calibs")
+        # Now, make a dir with model name if it doesnt exist
+        if not os.path.exists(f"threshold_calibs/{model_name}"):
+            os.makedirs(f"threshold_calibs/{model_name}")
+        # now, for the sparsity target (args.sparse_aggression), save a pkl file with mean_threshold_predpresm
+        with open(f"threshold_calibs/{model_name}/{args.token_sparse_method}.pkl", "wb") as f:
+            torch.save(mean_threshold_predpresm, f)
+        print(mean_threshold_predpresm)
         exit(0)
+    if args.test_with_thresholds:
+        effective_sparsity_list = torch.tensor(effective_sparsity_list)
+        mean_sparsity = effective_sparsity_list.mean().item()
+        stddev_sparsity = effective_sparsity_list.std().item()
+        # Here, write to a file calib_info.csv in append more
+        # write the model_name, token_sparse_method, mean_sparsity, stddev_sparsity, perplexity
+        if not os.path.exists("calib_info.csv"):
+            with open("calib_info.csv", "w") as f:
+                f.write("model_name,token_sparse_method,mean_sparsity,stddev_sparsity,perplexity\n")
+        with open("calib_info.csv", "a") as f:
+            f.write(f"{model_name},{args.token_sparse_method},{mean_sparsity},{stddev_sparsity},{perplexity}\n")
 
-        import pdb; pdb.set_trace()
-        head_preservation_info = {}
-        for head_idx in range(num_heads):
-            tok_pres_counts = []
-            for token_idx in loc_tokens_all[0]:
-                preserve_tensor = [(~fm_bool_x[batch_idx, head_idx, token_idx:, token_idx]).int() for fm_bool_x in fm_bool]
-                tok_pres_counts.append([preserve_tensor_x.sum().item() for preserve_tensor_x in preserve_tensor])
-            head_preservation_info[f"head_{head_idx}"] = tok_pres_counts
-
-        data["tok_preserved"] = head_preservation_info
-        data["avg_removal_index"] = np.asarray(list(data["tok_preserved"].values())).mean()
-        head_hitrate = []
-        for layeridx in range(len(data['final_mask_allheads'])):
-            for headidx in range(data['final_mask_allheads'][layeridx].shape[1]):
-                target_decode_index = loc_tokens_all[-1]
-                if isinstance(target_decode_index, list):
-                    target_decode_index = target_decode_index[0]
-                valbx, valcx = torch.sort(data['final_mask_allheads'][layeridx][0, headidx, target_decode_index, :].bool().int())
-                
-                validindexes = [x[-1] for x in list(zip(valbx.tolist(), valcx.tolist())) if x[0] == 0]
-                target_loc_tokens = loc_tokens_all[0]
-                hit_indices = [1 if x in validindexes else 0 for x in target_loc_tokens]
-                head_hitrate.append(hit_indices)
-        data["head_hitrate"] = np.mean(head_hitrate)
-        data["tok_preferred"] = sum(
-                        data['final_mask_allheads'][layeridx][0, :, target_decode_index, :].bool().int().sum(dim=0)
-                        for layeridx in range(len(data['final_mask_allheads']))
-                    ).tolist()
-        # get indexes of top 50%
-        data["top_crosshead_tokidx"] = torch.topk(torch.tensor(data["tok_preferred"]), int(len(data["tok_preferred"])/2), largest=True).indices.tolist()
-    total_inaccuracy = 0
-    total_hitrate = 0
-    miss_count = 0
-
-    print("Index\t Removal Index\t Location Inaccuracy\t Location Miss\t Head Token Identification Accuracy")
-    for idx in range(len(all_investigations)):
-        print("Index: ", idx, all_investigations[idx]['avg_removal_index'], all_investigations[idx]['location_inaccuracy'], all_investigations[idx]['location_miss'], all_investigations[idx]['head_hitrate'])
-        total_inaccuracy += all_investigations[idx]['location_inaccuracy']
-        total_hitrate += all_investigations[idx]['head_hitrate']
-        if all_investigations[idx]['location_miss']:
-            miss_count += 1
-
-    avg_inaccuracy = total_inaccuracy / len(all_investigations)
-    avg_miss = miss_count / len(all_investigations)
-    avg_hitrate = total_hitrate / len(all_investigations)
-
-    def escape_latex(text):
-        """Escapes LaTeX special characters like _, <, >, and |."""
-        text = text.replace("_", "\\_")  # Escape underscores
-        text = text.replace("<", "\\textless ")  # Escape <
-        text = text.replace(">", "\\textgreater ")  # Escape >
-        text = text.replace("|", "\\textbar ")  # Escape |
-        return text
-
-    import os
-    import json
-
-    # Dictionary to store LaTeX formatted text
-    latex_dict = {}
-
-    for idx, data in enumerate(all_investigations):
-        tokens = data['tokens']
-        predicted_tokens = data['predicted_tokens']
-        incorrect_indices = set(data['incorrect_indices'])
-        location_token_idxs = data['location_token_idxs']
-        top_preferred_tokens = data["top_crosshead_tokidx"]
-
-        # Generate LaTeX formatted text
-        latex_text = []
-        for i in range(len(tokens)):
-            token = escape_latex(tokens[i])  # Escape LaTeX special characters
-            predicted_token = escape_latex(predicted_tokens.get(i, ""))
-            formatted_token = token
-
-            if i in incorrect_indices:
-                if i in location_token_idxs[1]:
-                    formatted_token = (
-                        f"\\textbf{{\\textcolor{{red!50!black}}{{\\sout{{{predicted_token}}}}}}}"
-                        f" \\textbf{{\\textcolor{{yellow!50!black}}{{\\underline{{({token})}}}}}}"
-                    )
-                elif i in location_token_idxs[0]:
-                    formatted_token = f"\\textit{{\\textcolor{{green!50!black}}{{{token}}}}}"
-                else:
-                    formatted_token = f"\\textcolor{{red!50!black}}{{{token}}}"
-            elif any(i in sublist for sublist in location_token_idxs):
-                if i in location_token_idxs[0]:  # Initial appearance
-                    formatted_token = f"\\textbf{{\\textcolor{{green!50!black}}{{\\underline{{{token}}}}}}}"
-                elif i in location_token_idxs[1]:  # Final appearance
-                    if token == predicted_token:  # Correct prediction
-                        formatted_token = f"\\textbf{{\\textcolor{{green!50!black}}{{\\underline{{{token}}}}}}}"
-                    else:
-                        formatted_token = (
-                            f"\\textbf{{\\textcolor{{red!50!black}}{{\\sout{{{predicted_token}}}}}}}"
-                            f" \\textbf{{\\textcolor{{yellow!50!black}}{{\\underline{{({token})}}}}}}"
-                        )
-            
-            # Apply wavy underline if token is in top_preferred_tokens
-            if i in top_preferred_tokens:
-                formatted_token = f"\\wavyuline{{{formatted_token}}}"
-
-            latex_text.append(formatted_token)
-
-        # Store LaTeX formatted text
-        latex_dict[idx] = " ".join(latex_text)
-
-    # Create output directory
-    output_dir = f"latex_traces/latex_{args.model_path.split('/')[-1]}/{args.eval_llm_mode}"
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "latex_text.json")
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(latex_dict, f, indent=4)
-    print(f"LaTeX formatted text saved to {output_path}")
-
-
-    print(f"\nAverage Location Inaccuracy: {avg_inaccuracy:.2f}")
-    print(f"Average Location Miss Rate: {avg_miss:.2f}")
-    print(f"Average Head Token Identification Accuracy: {avg_hitrate:.2f}")
-    import csv
-    import os
-
-    data = {
-        'model_path': args.model_path,
-        'eval_llm_mode': args.eval_llm_mode,
-        'num_tok_per_page': args.num_tok_per_page,
-        'token_sparse_method': args.token_sparse_method,
-        'avg_inaccuracy': avg_inaccuracy,
-        'avg_miss': avg_miss,
-        'avg_hitrate': avg_hitrate
-    }
-    csv_file = 'mrcr_results.csv'
-    file_exists = os.path.exists(csv_file) and os.path.getsize(csv_file) > 0
-
-    with open(csv_file, mode='a', newline='') as file:
-        writer = csv.DictWriter(file, fieldnames=data.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(data)
-
-    if total_tokens > 0:
-        avg_loss = total_loss / total_tokens
-        perplexity = torch.exp(torch.tensor(avg_loss)).item()
-    else:
-        perplexity = float('inf')
-    import pdb; pdb.set_trace()
-    # Restore modules to default
+        print("You tried to use calibrated values for testing expected sparsity.")
+        print("Mean Sparsity: ", mean_sparsity)
+        print("Stddev Sparsity: ", stddev_sparsity)
+    ### Threshold variance investigation
     for module in model.modules():
         if module.__class__.__name__.endswith("AttentionExperimental"):
             module.calc_hitrates = False
-
-    print(f"Perplexity on custom sentences: {perplexity}")
-    exit(0)
-    return perplexity, all_investigations
+    if torch.isnan(perplexity):
+        import pdb; pdb.set_trace()
+    return perplexity.item(), None
 
 
 def decode_tokenized_input(input_ids, tokenizer):
@@ -622,6 +502,387 @@ def tokenize_fn(tokenizer, example):
     )
     return {"input_ids": outputs["input_ids"].view(-1, context_length)}
 
+def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
+    """
+    Fine-tunes the model by training only the sparse_token_predictor with sparsity regularization.
+    
+    Args:
+        model: The neural network model.
+        tokenizer: The tokenizer corresponding to the model.
+        lambda_sparsity (float): Weight for the sparsity regularization term.
+    
+    Returns:
+        The fine-tuned model.
+    """
+    if args.model_parallelism:
+        model_producer_layers = get_producer_layers(model)
+        for producer_layer in model_producer_layers:
+            for param in producer_layer.sparse_token_predictor.parameters():
+                param = param.to('cuda:0')
+        for name, param in model.named_parameters():
+            print(f"Layer: {name}, Device: {param.device}")
+    max_seq_len = args.rpj_train_seqlen
+    # 4 batch size with 8192 seq len attempt -- no work
+    batch_size = 1  # Adjust based on your GPU memory
+
+    print("Loading training dataset...")
+    a = time.time()
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+        
+    # assert args.architecture == "llama", "RedPajama dataset is supported only for LLaMA architecture."
+    if args.finetune_dataset == "redpajama":
+        dataset_path = f"redpajama_1t_sample_{tokenizer.name_or_path}"
+        if os.path.exists(dataset_path):
+            dataset = load_from_disk(dataset_path)
+        else:
+            dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample")
+
+            tokenizer.model_max_length = max_seq_len
+            dataset = dataset.shuffle().map(
+                partial(tokenize_fn, tokenizer),
+                batched=True,
+                batch_size=512,
+                num_proc=4,
+                remove_columns=["text", "meta"]
+            )
+            # Ensure parent directories are created
+            os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
+            dataset.save_to_disk(dataset_path)
+
+        # Remove unnecessary columns and set format
+        dataset = dataset["train"].remove_columns([col for col in dataset["train"].column_names if col != "input_ids"])
+        dataset.set_format(type='torch', columns=['input_ids'])
+    elif args.finetune_dataset == "c4_realnewslike":
+        dataset_path = f"c4_datasets/c4_realnewslike_{tokenizer.name_or_path}"
+        if os.path.exists(dataset_path):
+            dataset = load_from_disk(dataset_path)
+        else:
+            dataset = load_dataset("allenai/c4", "realnewslike", split="train")
+
+            tokenizer.model_max_length = max_seq_len
+            # if tokenizer.model_max_length > 262144:
+            #     tokenizer.model_max_length = 262144
+            # Take a x% random subset -- for testing purposes.
+            subset_size = int(0.04 * len(dataset))
+            indices = sample(range(len(dataset)), subset_size)
+            dataset = dataset.select(indices)
+
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            # Tokenize the dataset
+            dataset = dataset.map(
+                partial(tokenize_fn, tokenizer),
+                batched=True,
+                batch_size=512,
+                num_proc=4,  # Adjust for your system's parallelism
+                remove_columns=["url", "timestamp", "text"]  # Remove fields not needed
+            )
+
+            # Save the processed dataset to disk for reuse
+            os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
+            dataset.save_to_disk(dataset_path)
+
+        # Remove unnecessary columns and set format
+        dataset = dataset.remove_columns([col for col in dataset.column_names if col != "input_ids"])
+        dataset.set_format(type="torch", columns=["input_ids"])
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Prepare the DataLoader
+    if args.train_subset_fac is not None:
+        subset_size = len(dataset) // args.train_subset_fac
+    else:
+        subset_size = len(dataset)
+
+    # subset = dataset.select(range(subset_size))
+    # Shuffle the dataset to ensure random sampling
+    assert args.seed is not None, "Seed must be provided to ensure consistent dataset shuffling for resuming."
+    shuffled_dataset = dataset.shuffle(seed=args.seed)
+
+    # Select a random subset
+    subset = shuffled_dataset.select(range(subset_size))
+
+    print("Length of dataset before flattening: ", len(subset))
+    oneitemlen = next(iter(subset))['input_ids'].shape
+    print("One item length: ", oneitemlen)
+    max_repeat_fraction = (
+        0.2 if max_seq_len <= 2048 else
+        0.15 if max_seq_len <= 4096 else
+        0.05 if max_seq_len <= 8192 else
+        0.05 if max_seq_len <= 16384 else
+        0.02
+    )
+    subset = FlattenedDataset(subset, max_seq_len, max_repeat_fraction)
+    # seq_len_to_repeat_fracs = 
+    # subset = FlattenedDataset(subset, max_seq_len)
+    print("Length of dataset after flattening: ", len(subset))
+    data_loader = DataLoader(subset, batch_size=batch_size, shuffle=True)
+    print("Tokenization complete in ", time.time() - a, " seconds")
+    model = model.float()
+
+    for param in model.parameters():
+        param.requires_grad = False
+    producer_layers = get_producer_layers(model)
+    for producer_layer in producer_layers:
+        for param in producer_layer.sparse_token_predictor.parameters():
+            param.requires_grad = True
+        for param in producer_layer.sparse_head_predictor.parameters():
+            param.requires_grad = True
+    
+    print("Set producer layer parameters to require gradients.")
+    
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.pred_lr
+    )
+    
+    model.train()
+
+    set_inference_mode(model, False)
+    mask_array = None
+
+    print("Inference mode: False")
+    num_epochs = 1
+    batch_item = next(iter(data_loader))
+    nsamples = len(data_loader) * num_epochs
+    tot_steps = nsamples * num_epochs
+    print("\n\n Total Steps: ", tot_steps, "\n\n")
+    
+    total_steps = tot_steps // args.grad_accum_steps
+    
+    from transformers.optimization import get_cosine_schedule_with_warmup
+
+    warmup_steps = int(0.1 * tot_steps)
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=tot_steps
+    )
+    eval_freq = args.evalgap
+    grad_norm = 0
+    min_wk2 = float('inf')
+    observed_task_losses = []
+    observed_head_losses = []
+    total_tok_seen = 0
+    num_grad_skip = 0
+    if args.model_resume_path is not None:
+        print(f"Resuming training from checkpoint: {args.model_resume_path}")
+        checkpoint = torch.load(args.model_resume_path)
+        model_producer_layer = get_producer_layers(model)
+
+        producer_layer_weights = checkpoint['model_state_dict']
+        model_producer_layers = get_producer_layers(model)
+        for idx, producer_layer_weight in enumerate(producer_layer_weights):
+            model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
+        
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        step = checkpoint['step']
+        # set wandb step
+        current_step = checkpoint.get('wandb_step', 0)
+        # Fake the missing steps
+        for step in range(current_step):
+            wandb.log({}, step=step)  # Log nothing but set the step
+        epoch = checkpoint.get('epoch', 0)
+        step = checkpoint['step']
+        print(f"Resumed at step {step}, epoch {epoch}")
+    else:
+        step = 0
+        epoch = 0
+    # convert model to float16 half precision
+    # model = model.half()
+    # import pdb; pdb.set_trace()
+    avg_headhit, avg_tokhit = 0, 0
+    avg_headhit_corr, avg_tokhit_corr = 0, 0
+    train_progress = 0
+    for epoch in range(epoch, num_epochs):
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        epoch_loss = 0.0  # Reset epoch loss
+        running_loss = 0.0
+        progress_bar = tqdm.tqdm(data_loader, desc="Training...", initial=step % len(data_loader))
+        for batch_idx, batch in enumerate(progress_bar):
+            train_progress += 1
+            try:
+                if batch_idx < step:  # Skip processed batches in current epoch
+                    continue
+                calc_hitrates = False
+                for module in model.modules():
+                    # Match modules ending with AttentionExperimental
+                    if module.__class__.__name__.endswith("AttentionExperimental"):
+                        if step % 20 == 0:
+                            calc_hitrates = True
+                            module.calc_hitrates = calc_hitrates
+                        else:
+                            calc_hitrates = False
+                            module.calc_hitrates = False
+
+                input_ids = batch.to(model.device)
+                input_ids = input_ids[:, :max_seq_len]
+                total_tok_seen += input_ids.size(1) * input_ids.size(0)  # L * B
+                attention_mask = (input_ids != tokenizer.pad_token_id).long().to(model.device)
+                labels = input_ids.clone()
+                outputs = model(input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
+                task_loss = outputs.loss
+                mse_match_loss = 0
+                head_match_loss = 0
+                nlayers = 0
+                headhit_accs = []
+                tok_hit_accs = []
+                headhit_corr = []
+                tok_hit_corr = []
+
+                for module in model.modules():
+                    if module.__class__.__name__.endswith("AttentionExperimental"):
+                        if hasattr(module, 'msemagn_loss'):
+                            nlayers += 1
+                            mse_match_loss += module.msemagn_loss.to('cuda:0')
+                            module.msemagn_loss = 0
+                            if args.train_headpredictor:
+                                head_match_loss += module.headmsemagn_loss.to('cuda:0')
+                                module.headmsemagn_loss = 0
+                            if calc_hitrates:
+                                headhit_accs.append(module.head_hit_acc)
+                                tok_hit_accs.append(module.tok_hit_acc)
+                                headhit_corr.append(module.head_mean_rank_corr)
+                                tok_hit_corr.append(module.tok_mean_rank_corr)
+
+                mse_match_loss = mse_match_loss / nlayers
+                observed_task_losses.append(mse_match_loss.item())
+                if args.train_headpredictor:
+                    observed_head_losses.append(head_match_loss.item())
+                else:
+                    observed_head_losses.append(0)
+                if calc_hitrates:
+                    avg_headhit = 100 * sum(headhit_accs) / len(headhit_accs)
+                    avg_tokhit = 100 * sum(tok_hit_accs) / len(tok_hit_accs)
+                    avg_headhit_corr = sum(headhit_corr) / len(headhit_corr)
+                    avg_tokhit_corr = sum(tok_hit_corr) / len(tok_hit_corr)
+
+                if args.train_headpredictor:
+                    mse_match_loss.backward(retain_graph=True)
+                    (100 * head_match_loss).backward()
+                else:
+                    mse_match_loss.backward()
+
+                step += 1
+
+                assert args.grad_accum_steps == 1, "Gradient accumulation not supported for now."
+                for producer_layer in producer_layers:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_token_predictor.parameters(), max_norm=args.max_norm)
+                    head_grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_head_predictor.parameters(), max_norm=args.max_norm)
+
+                if step % args.save_interval == 0:
+                    save_checkpoint(args, model, optimizer, scheduler, step=step, epoch=epoch, note="intermediate")
+
+                if grad_norm.item() > 20000:
+                # if grad_norm.item() > 150:
+                    print(f"Gradient norm: {grad_norm.item()}, skipped steps: {num_grad_skip}")
+                    print("Skipping step due to high gradient norm.")
+                    num_grad_skip += 1
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    if dowandb:
+                        try:
+                            hloss = (100 * head_match_loss).item()
+                        except:
+                            hloss = 0
+                        wandb.log({
+                            "MSE_Attn_Loss": mse_match_loss.item(),
+                            "Head_Loss": hloss,
+                            "Head Hit Acc": avg_headhit,
+                            "Token Hit Acc": avg_tokhit,
+                            "Head Hit Corr": avg_headhit_corr,
+                            "Token Hit Corr": avg_tokhit_corr,
+                            "task_loss": task_loss.item(),
+                            "MSE_Attn_RunningLoss": running_loss,
+                            "grad_norm": grad_norm.item(),  # Log gradient norm
+                            "learning_rate": scheduler.get_last_lr()[0],  # Log current learning rate
+                            "total_tokens": total_tok_seen,
+                            "stepskip": 1,
+                            "TrainProgress": float(train_progress / len(data_loader)),
+                        })
+                    continue
+
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()  # Reset gradients after update
+
+                epoch_loss += mse_match_loss.item()
+                running_loss = (running_loss * step + mse_match_loss.item()) / (step + 1)
+                progress_bar.set_description(f"Training... (Running Loss: {running_loss:.4e})")
+                torch.cuda.empty_cache()
+                gc.collect()
+                if step % eval_freq == 0:
+                    print("Subset-eval here.")
+                    set_inference_mode(model, True)
+                    eval_pplx, _ = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=True, config=config)
+                    if dowandb:
+                        wandb.log({"traintime_pplx": eval_pplx})
+                    if args.do_downstream_eval:
+                        if step % ( 4 * eval_freq ) == 0 and step > 10:
+                            print("Evaluating on additional tasks...")
+                            task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn, train_headpredictor=args.train_headpredictor)
+                            if dowandb:
+                                for task_name, task_res in task_results.items():
+                                    try:
+                                        wandb.log({f"{task_name}": task_res['acc,none']})
+                                    except KeyError:
+                                        pass
+                    if eval_pplx < min_wk2:
+                        min_wk2 = eval_pplx
+                        print(f"New best model found with perplexity: {min_wk2:.4f}")
+                        save_model(args, model, note="_best")
+                    set_inference_mode(model, False)
+                    model.train()
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                if dowandb:
+                    if args.train_headpredictor:
+                        hloss = (100 * head_match_loss).item()
+                    else:
+                        hloss = 0
+                    wandb.log({
+                        "MSE_Attn_Loss": mse_match_loss.item(),
+                        "Head_Loss": hloss,
+                        "Head Hit Acc": avg_headhit,
+                        "Token Hit Acc": avg_tokhit,
+                        "Head Hit Corr": avg_headhit_corr,
+                        "Token Hit Corr": avg_tokhit_corr,
+                        "task_loss": task_loss.item(),
+                        "MSE_Attn_RunningLoss": running_loss,
+                        "grad_norm": grad_norm.item(),  # Log gradient norm
+                        "learning_rate": scheduler.get_last_lr()[0],  # Log current learning rate
+                        "total_tokens": total_tok_seen,
+                        "stepskip": 1,
+                        "TrainProgress": float(train_progress / len(data_loader)),
+                    })
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"An error occurred: {e}")
+
+            except Exception as e:
+                if "ScaledDotProductEfficientAttentionBackward0" in str(e):
+                    print(f"RuntimeError encountered: {e}. Skipping this iteration.")
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    continue  # Skip this batch
+                else:
+                    print(f"Interesing error: {e}")
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    import traceback
+                    traceback.print_exc()
+                    import pdb; pdb.set_trace()
+                    continue
+        avg_train_loss = epoch_loss / nsamples
+        print(f"Average training loss for epoch {epoch+1}: {avg_train_loss:.4f}")
+    return model, mask_array
 
 
 if __name__ == '__main__':
@@ -649,11 +910,12 @@ if __name__ == '__main__':
     parser.add_argument('--model_mode', type=str, default="eval", choices=["eval", "finetune", "shadowllm"])
     parser.add_argument('--model_load_path', type=str, default=None, help='Path to load model')
     parser.add_argument('--model_resume_path', type=str, default=None, help='Path to resume training (includes optimizer, scheduler, and step states).')
-    parser.add_argument('--save_interval', type=int, default=5000, help='Number of steps after which to save a checkpoint.')
+    parser.add_argument('--save_interval', type=int, default=200, help='Number of steps after which to save a checkpoint.')
 
     # Current focus 
     parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
     parser.add_argument('--old_predictor', action='store_true', help='Old Predictor without proper LayerNorm implementations :(')
+    parser.add_argument('--lookahead', type=int, default=0)
     # Current focus 
     parser.add_argument('--sliding_window', type=int, default=None, help='Sliding window at eval IF comparing to SnapKV, set it to 16: Very Important!!!!!')
     parser.add_argument('--randomize_init', action='store_true', help='Very Experimental! Tries to train predictor on RANDOMLY initialized transformer...')
@@ -671,7 +933,7 @@ if __name__ == '__main__':
     parser.add_argument('--skip_outlier', type=int, default=None, help='Skip backprop when task loss is outlier, stabilizes training. Not done on WK2, only RPJ.')
 
     parser.add_argument('--no_pred_causal_mask', action='store_true', help='Enable or disable causal mask application')
-    parser.add_argument('--evalgap', type=int, default=1000, help='eval gap during training')
+    parser.add_argument('--evalgap', type=int, default=200, help='eval gap during training')
     parser.add_argument('--max_norm', type=int, default=20, help='Max Norm')
     parser.add_argument('--intdim', type=int, default=512, help='Int-Proc Dim')
     parser.add_argument('--token_sparse_method', type=str, default="progressive_5pc", help="LazyLLM, progressive_xpc, fixed_xpc...")
@@ -713,6 +975,10 @@ if __name__ == '__main__':
     random.seed(args.seed)
     os.environ["PYTHONHASHSEED"] = str(args.seed)
 
+    print("IF EVALUATING: To compare with SnapKV Fairly, please set --sliding_window to 16 for experiments.")
+    # if args.sliding_window is not None:
+    #     print("\n", "*"*50)
+    #     print("SLIDING WINDOW ONLY APPLIES TO BASELINE EVALUATIONS -- I.E., ONLY WHEN _baselines.py VARIANT IS IMPORTED.")
 
     if dowandb:
         if args.wname is not None:
@@ -742,21 +1008,28 @@ if __name__ == '__main__':
     config = AutoConfig.from_pretrained(model_path, use_auth_token=True, trust_remote_code=True)
     if args.model_parallelism:
         from transformers import AutoConfig
-        # from accelerate import init_empty_weights, dispatch_model, infer_auto_device_map
-        # offload_dir = tempfile.TemporaryDirectory()
-        # with init_empty_weights():
-        #     model = AutoModelForCausalLM.from_config(config)
-        # device_map = infer_auto_device_map(
-        #     model,
-        #     max_memory={i: "15GB" for i in range(torch.cuda.device_count())},
-        #     no_split_module_classes=["LlamaDecoderLayer"]
-        # )
         device_cnt = torch.cuda.device_count()
-        device_map = {"model.embed_tokens": 0, "model.rotary_emb": 0, "model.norm": device_cnt - 1, "lm_head": device_cnt - 1}
-        device_num_layers = config.num_hidden_layers // device_cnt
-        for i in range(config.num_hidden_layers):
-            device_map[f"model.layers.{i}"] = i // device_num_layers
-        print(f"Device map: {device_map}")
+        if device_cnt <= 2:
+            extra_param_device = device_cnt - 1
+            device_map = {"model.embed_tokens": extra_param_device, "model.rotary_emb": extra_param_device, "model.norm": extra_param_device, "lm_head": extra_param_device}
+            device_num_layers = config.num_hidden_layers // device_cnt
+            for i in range(config.num_hidden_layers):
+                device_map[f"model.layers.{i}"] = i // device_num_layers 
+        else:
+            extra_param_device = 0
+            device_map = {"model.embed_tokens": extra_param_device, "model.rotary_emb": extra_param_device, "model.norm": extra_param_device, "lm_head": extra_param_device}
+            # # strategy for llama2
+            # device_num_layers = config.num_hidden_layers // (device_cnt - 1)
+            # for i in range(config.num_hidden_layers):
+            #     device_map[f"model.layers.{i}"] = (i // device_num_layers + 1) % device_cnt
+            # device_map[f'model.layers.{0}'] = 0
+
+            # strategy for llama3
+            device_num_layers = config.num_hidden_layers // (device_cnt - 1)
+            for i in range(config.num_hidden_layers):
+                # device_map[f"model.layers.{i}"] = (i // device_num_layers + 1) % device_cnt
+                device_map[f"model.layers.{i}"] = (i % (device_cnt - 1)) + 1
+            device_map[f'model.layers.{0}'] = 0
         dtype = torch.float16 if args.model_mode == "eval" else torch.float32
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -766,6 +1039,7 @@ if __name__ == '__main__':
             use_auth_token=True,
             torch_dtype=dtype,
         )
+        # model.model.embed_tokens = model.model.embed_tokens.to('cuda:0')
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path, offload_folder=None, trust_remote_code=True, use_auth_token=True, **kwargs).cuda()
     if args.randomize_init:
@@ -873,6 +1147,7 @@ if __name__ == '__main__':
             module.flash_attn = args.flash_attn
             module.train_headpredictor = args.train_headpredictor
             module.min_sparse_index = args.min_sparse_index
+            module.lookahead = args.lookahead
             module.old_predictor = args.old_predictor
             module.num_layers_pred = module.producer_frequency  # Literally the gap is the number of layers to predict for.
             module.sliding_window = args.sliding_window
@@ -880,8 +1155,7 @@ if __name__ == '__main__':
             if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
                 if module.layer_idx % args.producer_frequency == 0:
                     module.update_predictor()
-    if not args.model_parallelism:
-        model = model.cuda()
+
     try:
         print("\n\n\n Expected Sparsity For Method: ", sum(token_sparsity_list) / len(token_sparsity_list), "\n\n\n")
     except:
@@ -894,6 +1168,8 @@ if __name__ == '__main__':
         wandb.log({
             "avg_token_sparsity": avg_token_sparsity
         })
+    if not args.model_parallelism:
+        model = model.cuda()
     try:
         producer_layer = get_producer_layers(model)[0]
 
@@ -950,20 +1226,20 @@ if __name__ == '__main__':
             for idx, producer_layer_weight in enumerate(producer_layer_weights):
                 try:
                     model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
+                    if args.model_parallelism:
+                        model_producer_layers[idx].to("cuda:0")
                 except Exception as e:
                     print(f"Error loading producer layer {idx}: {e}")
                     print("\n\nContinuing... !! Bad Perf If Unintentional !!\n\n")
-
             
         set_inference_mode(model, True)
 
         model.eval()
-
         torch.cuda.empty_cache()
         gc.collect()
         perplexity = 0
         if args.do_wikitext_eval:
-            perplexity, eval_mask = investigate_custom_sentences(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=False)
+            perplexity, eval_mask = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=False, config=config)
             print(f"Perplexity on Wikitext-2: {perplexity:.2f}")
         if args.do_downstream_eval:
             print("Evaluating on additional tasks...")
@@ -1022,6 +1298,77 @@ if __name__ == '__main__':
             if args.do_longbench_eval:
                 row.extend([longbench_scores[dataset] for dataset in longbench_scores.keys()])
             results_writer.writerow(row)
+    elif args.model_mode == "finetune":
+        set_inference_mode(model, False)
+        model.train()
+        print("Inference mode: False")
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        model, train_mask = finetune_actmse(model, tokenizer, testenc_wk2, args=args)
+
+        save_model(args, model, note=None)
+        set_inference_mode(model, True)
+        model.eval()
+    
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        effective_sparsities = []
+        for module in model.modules():
+            if module.__class__.__name__.endswith("AttentionExperimental"):
+                if module.effective_sparsity is not None:
+                    effective_sparsities.append(module.effective_sparsity)
+        
+        print(f"Effective average token sparsity: {sum(effective_sparsities) / len(effective_sparsities)}")
+        
+        args.true_token_sparsity = sum(effective_sparsities) / len(effective_sparsities)
+
+        perplexity = 0
+        if args.do_wikitext_eval:
+            print(f"Perplexity on Wikitext-2: {perplexity:.2f}")
+        if args.do_longbench_eval:
+            longbench_results = run_long_bench_evaluation(model, tokenizer, args)
+            print(f"LongBench evaluation results: {json.dumps(longbench_results, indent=4)}")
+            longbench_scores = {}
+            for dataset in longbench_results:
+                longbench_scores[dataset] = longbench_results[dataset]
+                print(f"Dataset: {dataset}, Score: {longbench_scores[dataset]}")
+        if args.do_downstream_eval:
+            print("Evaluating on additional tasks...")
+            task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn, train_headpredictor=args.train_headpredictor)
+            print(f"Task evaluation results: {json.dumps(task_results, indent=4)}")
+        else:
+            task_results = {}
+        possible_keys = ["acc,none", "em,none", "f1,none", "exact,none", "best_f1,none", "HasAns_exact,none", "NoAns_exact,none"]
+
+        task_accuracies = {}
+        for task in task_results:
+            for key in possible_keys:
+                if key in task_results[task]:
+                    cleaned_key = key.replace(",none", "")  # Remove ',none'
+                    task_accuracies[f"{task}_{cleaned_key}"] = task_results[task][key]
+                    print(f"Task: {task}, Key: {cleaned_key}, Value: {task_results[task][key]}")
+
+        if not os.path.exists(f"{result_save_folder}/"):
+            os.makedirs(f"{result_save_folder}/")
+        with open(f"{result_save_folder}/" + args.result_file, mode='a') as results_file:
+            results_writer = csv.writer(results_file)
+            args_dict = vars(args)
+            header = list(args_dict.keys())
+            header.append("perplexity")  # Add perplexity to the header
+            header.extend(task_accuracies.keys())
+            # header.extend([f"{task}_acc" for task in task_accuracies.keys()])
+            if args.do_longbench_eval:
+                header.extend([f"{dataset}_longbench_score" for dataset in longbench_scores.keys()])
+            results_writer.writerow(header)
+            row = list(args_dict.values())
+            row.append(perplexity)
+            row.extend([task_accuracies[task] for task in task_accuracies.keys()])
+            if args.do_longbench_eval:
+                row.extend([longbench_scores[dataset] for dataset in longbench_scores.keys()])
+            results_writer.writerow(row)
+
     elif args.model_mode == "shadowllm":
         raise NotImplementedError
     else:
