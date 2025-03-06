@@ -1,7 +1,7 @@
 # TokenButler: Token Importance Is Predictable
 
 
-![TokenButler Logo](https://github.com/abdelfattah-lab/TokenButler/blob/main/tokenbutlerlogo.png)
+![TokenButler Logo](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/tokenbutlerlogo.png)
 
 This repository contains code to reproduce the experiments in the paper: TokenButler: Token Importance Is Predictable. 
 
@@ -65,11 +65,11 @@ Simply append `--model_parallelism` to split model across GPUs for longer-contex
 
 # Predictor Architecture
 
-![Predictor Architecture](https://github.com/abdelfattah-lab/TokenButler/blob/main/mainfig.png)
+![Predictor Architecture](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/mainfig.png)
 
 # Custom Synthetic Task
 
-![Custom Synthetic Task](https://github.com/abdelfattah-lab/TokenButler/blob/main/datasetfig.png)
+![Custom Synthetic Task](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/datasetfig.png)
 
 ## Citation
 
