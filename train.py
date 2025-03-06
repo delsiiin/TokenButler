@@ -272,23 +272,17 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
 def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_list=["arc_easy", "hellaswag"], limit=None, flash_attn=False, train_headpredictor=False):
 
     for module in model.modules():
-        # Here, we should take care to set head predictor flash attention mode appropriately
         module.flash_attn = False
     model.seqlen = max_length
     lm_obj = HFLM(pretrained=model, tokenizer=tokenizer, add_bos_token=False, batch_size=batch_size)
 
 
-    # Get the original forward method
     original_forward = lm_obj.model.forward
-
-    # Define a patched forward method
     def patched_forward(*args, **kwargs):
-        kwargs["past_key_values"] = PredictorDynamicCache()
-
-        # Call the original forward method
+        if not isinstance(kwargs["past_key_values"], PredictorDynamicCache):
+            kwargs["past_key_values"] = PredictorDynamicCache()
         return original_forward(*args, **kwargs)
 
-    # Apply the patch
     lm_obj.model.forward = patched_forward
 
     task_manager = lm_eval.tasks.TaskManager()

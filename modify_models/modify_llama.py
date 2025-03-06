@@ -500,6 +500,12 @@ class LlamaAttentionExperimental(nn.Module):
         if not output_attentions:
             attn_weights = None
 
+        if q_len == 1:
+            if self.layer_idx == 31:
+                print(past_key_value.key_cache[0].shape, "\tDecoded\t", self.numd)
+            self.numd += 1
+        else:
+            self.numd = 0
         return attn_output, attn_weights
 
 def convert_kvcache_experimental(model, config, producer_frequency, heavy_const=256, group_factor=8, label_bits=4):
