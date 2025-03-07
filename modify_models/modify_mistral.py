@@ -185,7 +185,8 @@ class MistralAttentionExperimental(nn.Module):
             causal_mask_4d = causal_mask_2d.unsqueeze(0).expand(bsz, 1, q_len, kv_seq_len)
             # Now fill -inf where the mask is True
             attention_mask = torch.full_like(causal_mask_4d, 0, dtype=hidden_states.dtype)
-            attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
+            if q_len != 1:
+                attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
 
         if self.inference_mode:
             min_sparse_index = self.min_sparse_index

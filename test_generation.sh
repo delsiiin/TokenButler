@@ -1,0 +1,20 @@
+python test_generation.py \
+    --proj_name TrainTokenButler \
+    --model_path meta-llama/Llama-3.1-8B \
+    --architecture llama \
+    --token_sparse_method fixed_1pc \
+    --model_mode eval \
+    --finetune_dataset c4_realnewslike \
+    --train_subset_fac 800 \
+    --train_seqlen 1024 \
+    --eval_llm_mode ExpPred \
+    --result_file "L3_8B_2k.csv" \
+    --no_wandb \
+    --wname L3_8B_2k \
+    --pred_lr 1e-3 \
+    --dDash 16 \
+    --intdim 512 \
+    --do_downstream_eval \
+    --task_list "winogrande,triviaqa" \
+    --eval_subset 1000 \
+    --eval_wk2_seqlen 1024

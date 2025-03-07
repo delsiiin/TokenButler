@@ -224,7 +224,8 @@ class LlamaAttentionExperimental(nn.Module):
             causal_mask_4d = causal_mask_2d.unsqueeze(0).expand(bsz, 1, q_len, kv_seq_len)
             # Now fill -inf where the mask is True
             attention_mask = torch.full_like(causal_mask_4d, 0, dtype=hidden_states.dtype)
-            attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
+            if q_len != 1:
+                attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
 
         if self.inference_mode:
             min_sparse_index = self.min_sparse_index
@@ -367,7 +368,6 @@ class LlamaAttentionExperimental(nn.Module):
                 effective_sparsity = 100 * (additional_deact.float() / num_active.float()).mean().item()
                 self.effective_sparsity = effective_sparsity
                 print("Effective Sparsity:", effective_sparsity, "%\t Sequence Length:", q_len)
-
         if self.layer_idx == 0:
             if self.effective_sparsity is None:
                 self.effective_sparsity = 0.0
@@ -416,6 +416,13 @@ class LlamaAttentionExperimental(nn.Module):
                 else:
                     self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
         
+        # if self.layer_idx == 31:
+        #     if q_len == 1:
+        #         self.dtok += 1
+        #         print(f"Primary Key-Value Shape: {past_key_value.predictor_primary_key[0].shape}, Importance: {past_key_value.predictor_importance_key[0].shape}, Tok-Decoded: {self.dtok}")
+        #     else:
+        #         self.dtok = 0
+
         if not output_attentions:
             attn_weights = None
         return attn_output, attn_weights

@@ -212,15 +212,18 @@ class LlamaAttentionExperimental(nn.Module):
         key_len = key_states.size(2)
         bsz, q_len = query_states.size(0), query_states.size(2)
 
-        # Ahmed Modification. Always set an attention_mask
-        # Create causal mask if attention_mask is None
-        if attention_mask is None:
-            # [bsz, 1, q_len, kv_seq_len]
-            causal_mask = torch.ones((bsz, 1, q_len, kv_seq_len), device=hidden_states.device, dtype=torch.bool)
-            causal_mask = causal_mask.triu(diagonal=1)  # Upper triangular part
-            attention_mask = torch.zeros_like(causal_mask, dtype=hidden_states.dtype)
-            attention_mask.masked_fill_(causal_mask, float("-inf"))
 
+        if attention_mask is None:
+            # We want a [q_len, kv_seq_len] boolean upper-triangular mask
+            causal_mask_2d = torch.ones(q_len, kv_seq_len, 
+                                        device=hidden_states.device, 
+                                        dtype=torch.bool).triu(diagonal=1)
+            # Then shape it to [bsz, 1, q_len, kv_seq_len]
+            causal_mask_4d = causal_mask_2d.unsqueeze(0).expand(bsz, 1, q_len, kv_seq_len)
+            # Now fill -inf where the mask is True
+            attention_mask = torch.full_like(causal_mask_4d, 0, dtype=hidden_states.dtype)
+            if q_len != 1:
+                attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
 
         attn_o_precalc = False
         min_sparse_index = self.min_sparse_index
@@ -263,7 +266,6 @@ class LlamaAttentionExperimental(nn.Module):
                                                                     device=mask_tensor.device)
                             window = self.window_cache.get_window(q_len, key_len)
                             mask_tensor = enforce_sliding_window(mask_tensor, window)
-                        # import pdb; pdb.set_trace()
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                         final_mask = mask_tensor
                         self.final_mask_investigate = final_mask

@@ -255,7 +255,11 @@ def sorted_index_to_mask(
     dtype = sorted_indices.dtype
 
     # Step 1: Compute base K
-    query_positions = torch.arange(q_len, device=device).view(1, 1, q_len, 1).float() + 1.0
+    if q_len == 1:  
+        query_positions = torch.arange(q_len, device=device).view(1, 1, q_len, 1).float()
+        query_positions[0] = key_len + 1
+    else:
+        query_positions = torch.arange(q_len, device=device).view(1, 1, q_len, 1).float() + 1.0
     K_original = torch.ceil(query_positions * sparse_aggression).long()  # [1,1,q_len,1]
     K_original = torch.clamp(K_original, max=key_len)
 
