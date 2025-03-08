@@ -1,3 +1,24 @@
+
+### deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+python main.py \
+    --proj_name TrainTokenButler \
+    --model_path deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
+    --token_sparse_method fixed_40pc \
+    --model_mode finetune \
+    --finetune_dataset c4_realnewslike \
+    --train_subset_fac 4 \
+    --train_seqlen 1024 \
+    --eval_llm_mode ExpPred \
+    --result_file "L3_8B_R1_1K.csv" \
+    --wname L3_8B_R1_1K \
+    --pred_lr 1e-3 \
+    --dDash 32 \
+    --intdim 1024 \
+    --do_downstream_eval \
+    --task_list "winogrande,hellaswag,piqa,arc_easy" \
+    --eval_subset 1000 \
+    --eval_wk2_seqlen 1024
+
 ### Llama-3.2-1B Training Script
 python main.py \
     --proj_name TrainTokenButler \
@@ -84,25 +105,6 @@ python main.py \
     --eval_wk2_seqlen 1024
   
 
-### deepseek-ai/DeepSeek-R1-Distill-Llama-8B
-python main.py \
-    --proj_name TrainTokenButler \
-    --model_path deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
-    --token_sparse_method fixed_40pc \
-    --model_mode finetune \
-    --finetune_dataset c4_realnewslike \
-    --train_subset_fac 4 \
-    --train_seqlen 1024 \
-    --eval_llm_mode ExpPred \
-    --result_file "L3_8B_R1_1K.csv" \
-    --wname L3_8B_R1_1K \
-    --pred_lr 1e-3 \
-    --dDash 32 \
-    --intdim 1024 \
-    --do_downstream_eval \
-    --task_list "winogrande,hellaswag,piqa,arc_easy" \
-    --eval_subset 1000 \
-    --eval_wk2_seqlen 1024
   
     
 ### Mistral 7B v0.1 Training Script

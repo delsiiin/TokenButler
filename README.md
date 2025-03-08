@@ -3,9 +3,13 @@
 
 ![TokenButler Logo](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/tokenbutlerlogo.png)
 
-This repository contains code to reproduce the experiments in the paper: TokenButler: Token Importance Is Predictable. 
+This repository contains code to train and evaluate 'token importance' predictors.
 
 All of our results, traces from experiments are located in `ablation_results/`
+
+Note: Our predictor design has improved since the arXiv paper release (We added a layer-norm to stabilize training). Further, to focus on the main predictor design and training-eval scripts, we have removed the ablation scripts. To reproduce the original results and predictor models, please checkout commit `0412fc24a3b770e4d82e6d7064a8172f24c5fcd3` and download the old models.
+
+**We aim to update and improve our models, specifically by training them for longer on a more diverse dataset. Stay tuned for updates on better predictors!**
 
 
 ## Installation
@@ -17,36 +21,34 @@ All of our results, traces from experiments are located in `ablation_results/`
 `python -m pip install -r requirements.txt`
 
 ## Evaluation
-Please download our trained TokenButler predictor models from `To Be Added`
+Please download our trained TokenButler predictor models from this [Drive Link](https://drive.google.com/drive/folders/1psNZ1SU0LaZJ-x5MQGH59CzYSmeT4yRf?usp=sharing)
 
-To evaluate, example scripts are provided in `eval_scan.sh`
-
-### Notice on predictor design change:
-Currently, please also add an argument --old_predictor to evaluations.
-In earlier predictors, we had not used LayerNorm everywhere -- predictors still work, but we are now moving to proper LayerNorm integration for more stabilized training.
+To evaluate, example scripts are provided in `scripts/eval_scan.sh`
 
 ### Example script (Please update checkpoint path after downloading models):
 ```
-bash eval_scan.sh L3_3B_2k_1PC.csv L3_3B_2k_1PC ExpPred meta-llama/Llama-3.2-3B 1024 16 "/home/ya255/projects/all_contextual/expt_model/42_meta-llama_Llama-3.2-3B_False_llama_qk_128_4_c4_realnewslike_0.5_True_False_finetune_None_None_5000_False_False_1_False_False_False_False_4_8_2/0.001_16_None_False_1000_20_1024_fixed_40pc_ExpPred_AllContextual_Jan9_1000_4_2048_1024_1_28_4_16_4_MSE_False_False_L3_3B_2k_1PC.csv_L3_3B_2k_1PC_True_0.38571428571428584_20250111-042334.pt"
+bash eval_scan.sh L3_3B_2k_1PC.csv L3_3B_2k_1PC ExpPred meta-llama/Llama-3.2-3B 1024 16 "<PATH TO CHECKPOINT>"
 ```
 
 ### Modes supported: 
 - **TokenButler:** `ExpPred`
 - **Oracle:** `oracle`
-- **H2O:** `h2o_true`
-- **SnapKV:** `snapkv`
-- **Quest:** `quest`
+- **H2O:** `h2o_true` (Generation not supported)
+- **SnapKV:** `snapkv` (Generation not supported)
+- **Quest:** `quest` (Generation not supported)
 
 
-**Note on our evaluation strategy:** SnapKV and H2O are slow because they operate in a purely decode setting. With a 50% token budget, we simulate the entire input sequence as if it were fully decoded, allocating tokens proportionally to the sequence length at each decode step. This approach helps profile prefill-eviction-based methods by accurately emulating their token eviction policies across the full input sequence.
+**Important note on our evaluation strategy:** To properly test token-eviction/selection methods in a longer decode setting, we _simulate_ token eviction based strategies (SnapKV and H2O) in a purely decode setting. For example, with a 50% token budget, we simulate the entire input sequence as if it were fully decoded, allocating tokens **proportionally to the sequence length** at each decode step. This approach helps profile prefill-eviction-based methods by accurately emulating their token eviction policies across the full input sequence. Unfortunately, this also makes accuracy evaluation slower.
 
 To change downstream evaluation models, modify `task_list`, to evaluate on a smaller subset, modify `eval_subset`. To modify token sparsities being evaluated, modify `{10..60..10}` as desired.
 
 
 # Training
-Our training scripts are located in `train_predictors.sh`
+Our training scripts are located in `scripts/train_predictors.sh`
 
 We provide scripts for the following models:
+
+- **deepseek-ai/DeepSeek-R1-Distill-Llama-8B**
 - **meta-llama/Llama-3.2-1B**
 - **meta-llama/Llama-3.2-3B**
 - **meta-llama/Llama-2-7b-hf**
@@ -57,11 +59,21 @@ We provide scripts for the following models:
 - **microsoft/Phi-3.5-mini-instruct**
 - **microsoft/Phi-3-mini-4k-instruct**
 
-Training requires 1 A6000 GPU for these variants.
+Training requires 1 A6000 GPU for these variants. Longer-context training is possible using --model_parallelism
 
-## Model Parallel Support
+# Reasoning Model TokenButler Results
+|Method     |Sparsity (%)      |Perplexity|BBH Causal Judgement|MMLU-Pro           |
+|-----------|------------------|----------|--------------------|-------------------|
+|Dense      |0    |15.87     |0.55  |0.274 |
+|TokenButler|12.2 |15.90     |0.56  |0.275 |
+|TokenButler|31.0 |15.99     |0.55  |0.273 |
+|TokenButler|49.8 |16.22     |0.56  |0.273 |
+|TokenButler|68.2 |16.99     |0.55  |0.263 |
+|Oracle     |12.2 |15.85     |0.56  |0.273 |
+|Oracle     |31.0 |15.76     |0.55  |0.273 |
+|Oracle     |49.8 |15.66     |0.54  |0.271 |
+|Oracle     |68.3 |15.71     |0.51  |0.271 |
 
-Simply append `--model_parallelism` to split model across GPUs for longer-context length training runs.
 
 # Predictor Architecture
 

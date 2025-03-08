@@ -627,7 +627,7 @@ if __name__ == '__main__':
     with torch.no_grad(), autocast():
         premod_generated_ids = model.generate(
             input_ids=premod_input_ids,
-            max_new_tokens=100,
+            max_new_tokens=2000,
             do_sample=True,
             top_p=0.95,
             temperature=0.6,
@@ -747,7 +747,7 @@ if __name__ == '__main__':
     with torch.no_grad(), autocast():
         generated_ids = model.generate(
             input_ids=input_ids,
-            max_new_tokens=100,
+            max_new_tokens=2000,
             do_sample=True,
             top_p=0.95,
             temperature=0.6,

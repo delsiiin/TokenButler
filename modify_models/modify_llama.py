@@ -416,12 +416,12 @@ class LlamaAttentionExperimental(nn.Module):
                 else:
                     self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
         
-        # if self.layer_idx == 31:
-        #     if q_len == 1:
-        #         self.dtok += 1
-        #         print(f"Primary Key-Value Shape: {past_key_value.predictor_primary_key[0].shape}, Importance: {past_key_value.predictor_importance_key[0].shape}, Tok-Decoded: {self.dtok}")
-        #     else:
-        #         self.dtok = 0
+        if self.layer_idx == 31:
+            if q_len == 1:
+                self.dtok += 1
+                print(f"Primary Key-Value Shape: {past_key_value.predictor_primary_key[0].shape}, Importance: {past_key_value.predictor_importance_key[0].shape}, Tok-Decoded: {self.dtok}")
+            else:
+                self.dtok = 0
 
         if not output_attentions:
             attn_weights = None

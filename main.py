@@ -278,12 +278,28 @@ def patched_prepare_cache_for_generation(
         model_kwargs["past_key_values"] = PredictorDynamicCache()
     return model_kwargs
 
-def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=512, task_list=["arc_easy", "hellaswag"], limit=None, flash_attn=False, train_headpredictor=False):
+def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=None, task_list=["arc_easy", "hellaswag"], limit=None, flash_attn=False, train_headpredictor=False):
 
     for module in model.modules():
         module.flash_attn = False
-    model.seqlen = max_length
+
+    if max_length is not None:
+        model.seqlen = max_length
+
     lm_obj = HFLM(pretrained=model, tokenizer=tokenizer, add_bos_token=False, batch_size=batch_size)
+    
+    # Get the original forward method
+    original_forward = lm_obj.model.forward
+
+    # Define a patched forward method
+    def patched_forward(*args, **kwargs):
+        kwargs["past_key_values"] = PredictorDynamicCache()
+
+        # Call the original forward method
+        return original_forward(*args, **kwargs)
+
+    # Apply the patch
+    lm_obj.model.forward = patched_forward
 
     task_manager = lm_eval.tasks.TaskManager()
     print(f"Evaluating on tasks: {task_list}")
@@ -526,8 +542,13 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             dataset = load_from_disk(dataset_path)
         else:
             dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample")
-
             tokenizer.model_max_length = max_seq_len
+            # Hardcoded to use 4% of the dataset for tokenization.
+            subset_size = int(0.04 * len(dataset))
+            indices = sample(range(len(dataset)), subset_size)
+            dataset = dataset.select(indices)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
             dataset = dataset.shuffle().map(
                 partial(tokenize_fn, tokenizer),
                 batched=True,
@@ -546,13 +567,11 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             dataset = load_from_disk(dataset_path)
         else:
             dataset = load_dataset("allenai/c4", "realnewslike", split="train")
-
             tokenizer.model_max_length = max_seq_len
             # Hardcoded to use 4% of the dataset for tokenization.
-            subset_size = int(0.005 * len(dataset))
+            subset_size = int(0.04 * len(dataset))
             indices = sample(range(len(dataset)), subset_size)
             dataset = dataset.select(indices)
-
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
             # Tokenize the dataset
