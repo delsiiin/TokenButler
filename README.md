@@ -7,23 +7,65 @@ This repository contains code to train and evaluate 'token importance' predictor
 
 All of our results, traces from experiments are located in `ablation_results/`
 
-Note: Our predictor design has improved since the arXiv paper release (We added a layer-norm to stabilize training). Further, to focus on the main predictor design and training-eval scripts, we have removed the ablation scripts. To reproduce the original results and predictor models, please checkout commit `0412fc24a3b770e4d82e6d7064a8172f24c5fcd3` and download the old models.
+Note: Our predictor design has improved since the arXiv paper release (We added a layer-norm to stabilize training). Further, to focus on the main predictor design and training-eval scripts, we have removed the ablation scripts. To reproduce the original results and predictor models, please checkout commit `0412fc24a3b770e4d82e6d7064a8172f24c5fcd3` and download the old models. 
 
-**We aim to update and improve our models, specifically by training them for longer on a more diverse dataset. Stay tuned for updates on better predictors!**
+For the latest, new models, try the huggingface integration. [Wandb-Logs](https://wandb.ai/akhauriyash/TrainTokenButler) for trained models.
 
+## Huggingface Integration
+
+We support the following models directly through huggingface-transformers:
+
+- **DeepSeek-R1-Distill-Llama-8B-Butler**
+- **Llama-3.1-8B-Butler**
+- **Llama-2-7b-hf-Butler**
+- **Llama-3.2-3B-Butler**
+- **Llama-3.2-1B-Butler**
+
+The collection of models can be found [here](https://huggingface.co/collections/akhauriyash/tokenbutler-67cf181b5762d0d60e5f312b)
+
+Simply run `test_hf.py` or:
+
+```
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+question = "If millionaires have butlers, why don't million dollar language models have a butler too? I think its because "
+
+model_name = "akhauriyash/DeepSeek-R1-Distill-Llama-8B-Butler"
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
+
+generator = pipeline("text-generation", model=model, tokenizer=tokenizer)
+response = generator(question, max_new_tokens=200, do_sample=True, top_p=0.95, temperature=0.7)
+
+print(response[0]['generated_text'][len(question):])
+```
+
+Note that the 'default' configured sparsity is 50%. Further, there is a 'sliding window' of 128 and 8 'anchor tokens'. To 'change' the sparsity, you can use the following function after loading the model. Please note that the 'fixed' is the only supported strategy at the moment, which 'fixes' the sparsity of each layer (except the first) at the 'pc' (percentage) mentioned. This can also be found at `test_hf.py`. Sliding window and anchor tokens can be changed in a similar manner.
+
+```
+def set_sparsity(model, sparsity):
+    for module in model.modules():
+        if module.__class__.__name__.__contains__("AttentionExperimental"):
+            module.token_sparse_method = sparsity
+            module.set_token_sparsity()
+    return model
+
+model = set_sparsity(model, "fixed_60pc")
+```
 
 ## Installation
 
-`conda create --name TokenButler python=3.10`
-
-`conda activate TokenButler`
-
-`python -m pip install -r requirements.txt`
+```
+conda create --name TokenButler python=3.10
+conda activate TokenButler
+python -m pip install -r requirements.txt
+```
 
 ## Evaluation
-Please download our trained TokenButler predictor models from this [Drive Link](https://drive.google.com/drive/folders/1psNZ1SU0LaZJ-x5MQGH59CzYSmeT4yRf?usp=sharing)
+Please download our trained (old) TokenButler predictor models from this [Drive Link](https://drive.google.com/drive/folders/1psNZ1SU0LaZJ-x5MQGH59CzYSmeT4yRf?usp=sharing)
 
-To evaluate, example scripts are provided in `scripts/eval_scan.sh`
+
+To evaluate, example scripts are provided in `scripts/eval_scan.sh`, checkout commit `0412fc24a3b770e4d82e6d7064a8172f24c5fcd3`. Decode-generation may not work at this commit.
 
 ### Example script (Please update checkpoint path after downloading models):
 ```

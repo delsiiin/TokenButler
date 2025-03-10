@@ -541,10 +541,11 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         if os.path.exists(dataset_path):
             dataset = load_from_disk(dataset_path)
         else:
-            dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample")
+            dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample")["train"]
             tokenizer.model_max_length = max_seq_len
             # Hardcoded to use 4% of the dataset for tokenization.
-            subset_size = int(0.04 * len(dataset))
+            # subset_size = int(0.12 * len(dataset))
+            subset_size = int(len(dataset))
             indices = sample(range(len(dataset)), subset_size)
             dataset = dataset.select(indices)
             if tokenizer.pad_token is None:
@@ -559,7 +560,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
             dataset.save_to_disk(dataset_path)
 
-        dataset = dataset["train"].remove_columns([col for col in dataset["train"].column_names if col != "input_ids"])
+        dataset = dataset.remove_columns([col for col in dataset.column_names if col != "input_ids"])
         dataset.set_format(type='torch', columns=['input_ids'])
     elif args.finetune_dataset == "c4_realnewslike":
         dataset_path = f"c4_datasets/c4_realnewslike_{tokenizer.name_or_path}"
@@ -607,7 +608,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     oneitemlen = next(iter(subset))['input_ids'].shape
     print("One item length: ", oneitemlen)
 
-    subset = FlattenedDataset(subset, max_seq_len, max_repeat_fraction = 0.05)
+    subset = FlattenedDataset(subset, max_seq_len, max_repeat_fraction = 0.033)
 
     print("Length of dataset after flattening: ", len(subset))
     data_loader = DataLoader(subset, batch_size=batch_size, shuffle=True)
@@ -717,7 +718,11 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 if module.__class__.__name__.endswith("AttentionExperimental"):
                     if hasattr(module, 'msemagn_loss'):
                         nlayers += 1
-                        mse_match_loss += module.msemagn_loss.to('cuda:0')
+                        try:
+                            mse_match_loss += module.msemagn_loss.to('cuda:0')
+                        except:
+                            mse_match_loss += 0
+                            import pdb; pdb.set_trace()
                         module.msemagn_loss = 0
                         if args.train_headpredictor:
                             head_match_loss += module.headmsemagn_loss.to('cuda:0')
@@ -842,14 +847,14 @@ if __name__ == '__main__':
     parser.add_argument('--model_mode', type=str, default="eval", choices=["eval", "finetune"])
     parser.add_argument('--model_load_path', type=str, default=None, help='Path to load model')
     parser.add_argument('--model_resume_path', type=str, default=None, help='Path to resume training (includes optimizer, scheduler, and step states).')
-    parser.add_argument('--save_interval', type=int, default=200, help='Number of steps after which to save a checkpoint.')
+    parser.add_argument('--save_interval', type=int, default=500, help='Number of steps after which to save a checkpoint.')
     parser.add_argument('--architecture', type=str, default="llama", choices=["llama", "mistral", "mixtral", "qwen", "glm", "phi3"])
     parser.add_argument('--model_path', type=str, default="meta-llama/Llama-2-7b-hf", help='Selected model')
     parser.add_argument('--result_file', type=str, default="all_results.csv", help="Where to save results.")
     parser.add_argument('--wname', type=str, default=None, help="Name for wandb run")
     parser.add_argument('--model_parallelism', action='store_true', help='Enable model parallelism')
     parser.add_argument('--no_wandb', action='store_true', help='Enable or disable wandb logging')
-    parser.add_argument('--evalgap', type=int, default=200, help='eval gap during training')
+    parser.add_argument('--evalgap', type=int, default=2000, help='eval gap during training')
     parser.add_argument('--flash_attn', action='store_true', help='Use Flash Attention')
     
     # Train related arguments
