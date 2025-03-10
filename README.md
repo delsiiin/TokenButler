@@ -137,6 +137,9 @@ We provide scripts for the following models:
 Training requires 1 A6000 GPU for these variants. Longer-context training is possible using --model_parallelism
 
 # Reasoning Model TokenButler Results
+
+Model: DeepSeek-R1-Distill-Llama-8B-Butler
+
 |Method     |Sparsity (%)      |Perplexity|BBH Causal Judgement|MMLU-Pro           |
 |-----------|------------------|----------|--------------------|-------------------|
 |Dense      |0    |15.87     |0.55  |0.274 |
