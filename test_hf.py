@@ -17,8 +17,8 @@ def main():
     # Model name from the Hugging Face Hub
     # model_name = "akhauriyash/Llama-3.2-1B-Butler"                    ### [VALIDATED]
     # model_name = "akhauriyash/Llama-3.2-3B-Butler"                    ### [VALIDATED]
-    # model_name = "akhauriyash/Llama-3.1-8B-Butler"                    ### [VALIDATED]
-    model_name = "akhauriyash/DeepSeek-R1-Distill-Llama-8B-Butler"      ### [VALIDATED]
+    model_name = "akhauriyash/Llama-3.1-8B-Butler"                    ### [VALIDATED]
+    # model_name = "akhauriyash/DeepSeek-R1-Distill-Llama-8B-Butler"      ### [VALIDATED]
     # model_name = "akhauriyash/Llama-2-7b-hf-Butler"                   ### [VALIDATED]
     
     # Load the tokenizer and model

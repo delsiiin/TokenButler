@@ -1,7 +1,31 @@
 # TokenButler: Token Importance Is Predictable
 
+<div align="center">
+  <img src="https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/tokenbutlerlogo.png?raw=true" width="50%" alt="TokenButler" />
+</div>
 
-![TokenButler Logo](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/tokenbutlerlogo.png)
+<br>
+<div align="center" style="line-height: 1;">
+  <!-- Paper Badge -->
+  <a href="https://github.com/abdelfattah-lab/TokenButler/blob/main/TokenButler_Draft.pdf" target="_blank" style="margin: 2px;">
+    <img alt="Paper" 
+         src="https://img.shields.io/badge/Paper-View-orange?logo=readthedocs&logoColor=white" 
+         style="display: inline-block; vertical-align: middle;"/>
+  </a>
+  <!-- GitHub Badge -->
+  <a href="https://github.com/abdelfattah-lab/TokenButler" target="_blank" style="margin: 2px;">
+    <img alt="GitHub" 
+         src="https://img.shields.io/badge/GitHub-%23121011.svg?logo=github&logoColor=white" 
+         style="display: inline-block; vertical-align: middle;"/>
+  </a>
+  <!-- Huggingface Badge -->
+  <a href="https://huggingface.co/collections/akhauriyash/tokenbutler-67cf181b5762d0d60e5f312b" target="_blank" style="margin: 2px;">
+    <img alt="Huggingface" 
+         src="https://img.shields.io/badge/Hugging%20Face-FFD21E?logo=huggingface&logoColor=000" 
+         style="display: inline-block; vertical-align: middle;"/>
+  </a>
+</div>
+<br>
 
 This repository contains code to train and evaluate 'token importance' predictors.
 
