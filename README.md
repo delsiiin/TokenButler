@@ -27,15 +27,14 @@
 </div>
 <br>
 
+
+# Predictor Architecture
+
+![Predictor Architecture](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/mainfig.png)
+
 This repository contains code to train and evaluate 'token importance' predictors.
 
-All of our results, traces from experiments are located in `ablation_results/`
-
-Note: Our predictor design has improved since the arXiv paper release (We added a layer-norm to stabilize training). Further, to focus on the main predictor design and training-eval scripts, we have removed the ablation scripts. To reproduce the original results and predictor models, please checkout commit `0412fc24a3b770e4d82e6d7064a8172f24c5fcd3` and download the old models. 
-
-For the latest, new models, try the huggingface integration. [Wandb-Logs](https://wandb.ai/akhauriyash/TrainTokenButler) for trained models.
-
-## Huggingface Integration
+## Huggingface
 
 We support the following models directly through huggingface-transformers:
 
@@ -77,10 +76,11 @@ def set_sparsity(model, sparsity):
 model = set_sparsity(model, "fixed_60pc")
 ```
 
+All of our results, traces from experiments are located in `ablation_results/`
 
-# Predictor Architecture
+Note: Our predictor design has improved since the arXiv paper release (We added a layer-norm to stabilize training). Further, to focus on the main predictor design and training-eval scripts, we have removed the ablation scripts. To reproduce the original results and predictor models, please checkout commit `0412fc24a3b770e4d82e6d7064a8172f24c5fcd3` and download the old models from [Drive Link](https://drive.google.com/drive/folders/1psNZ1SU0LaZJ-x5MQGH59CzYSmeT4yRf?usp=sharing).
 
-![Predictor Architecture](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/mainfig.png)
+For the latest, new models, try the huggingface integration. [Wandb-Logs](https://wandb.ai/akhauriyash/TrainTokenButler) for trained models.
 
 ## Installation
 
@@ -91,8 +91,8 @@ python -m pip install -r requirements.txt
 ```
 
 ## Evaluation
-Please download our trained (old) TokenButler predictor models from this [Drive Link](https://drive.google.com/drive/folders/1psNZ1SU0LaZJ-x5MQGH59CzYSmeT4yRf?usp=sharing)
 
+Please download our trained (old) TokenButler predictor models from this [Drive Link](https://drive.google.com/drive/folders/1psNZ1SU0LaZJ-x5MQGH59CzYSmeT4yRf?usp=sharing)
 
 To evaluate, example scripts are provided in `scripts/eval_scan.sh`, checkout commit `0412fc24a3b770e4d82e6d7064a8172f24c5fcd3`. Decode-generation may not work at this commit.
 
@@ -150,6 +150,5 @@ Training requires 1 A6000 GPU for these variants. Longer-context training is pos
 |Oracle     |68.3 |15.71     |0.51  |0.271 |
 
 ## Citation
-
 
 Coming soon!
