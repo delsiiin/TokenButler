@@ -77,6 +77,11 @@ def set_sparsity(model, sparsity):
 model = set_sparsity(model, "fixed_60pc")
 ```
 
+
+# Predictor Architecture
+
+![Predictor Architecture](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/mainfig.png)
+
 ## Installation
 
 ```
@@ -96,11 +101,15 @@ To evaluate, example scripts are provided in `scripts/eval_scan.sh`, checkout co
 bash eval_scan.sh L3_3B_2k_1PC.csv L3_3B_2k_1PC ExpPred meta-llama/Llama-3.2-3B 1024 16 "<PATH TO CHECKPOINT>"
 ```
 
+# Custom Synthetic Task
+
+![Custom Synthetic Task](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/datasetfig.png)
+
 ### Modes supported: 
 - **TokenButler:** `ExpPred`
 - **Oracle:** `oracle`
-- **H2O:** `h2o_true` (Generation not supported)
-- **SnapKV:** `snapkv` (Generation not supported)
+- **H2O:** `h2o_true` (Generation not supported, prefill is 'decode simulated')
+- **SnapKV:** `snapkv` (Generation not supported, prefill is 'decode simulated')
 - **Quest:** `quest` (Generation not supported)
 
 
@@ -139,15 +148,6 @@ Training requires 1 A6000 GPU for these variants. Longer-context training is pos
 |Oracle     |31.0 |15.76     |0.55  |0.273 |
 |Oracle     |49.8 |15.66     |0.54  |0.271 |
 |Oracle     |68.3 |15.71     |0.51  |0.271 |
-
-
-# Predictor Architecture
-
-![Predictor Architecture](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/mainfig.png)
-
-# Custom Synthetic Task
-
-![Custom Synthetic Task](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/datasetfig.png)
 
 ## Citation
 
