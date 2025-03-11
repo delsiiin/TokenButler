@@ -7,7 +7,7 @@
 <br>
 <div align="center" style="line-height: 1;">
   <!-- Paper Badge -->
-  <a href="https://github.com/abdelfattah-lab/TokenButler/blob/main/TokenButler_Draft.pdf" target="_blank" style="margin: 2px;">
+  <a href="https://arxiv.org/abs/2503.07518" target="_blank" style="margin: 2px;">
     <img alt="Paper" 
          src="https://img.shields.io/badge/Paper-View-orange?logo=readthedocs&logoColor=white" 
          style="display: inline-block; vertical-align: middle;"/>
@@ -154,4 +154,14 @@ Model: DeepSeek-R1-Distill-Llama-8B-Butler
 
 ## Citation
 
-Coming soon!
+```
+@misc{akhauri2025tokenbutlertokenimportancepredictable,
+      title={TokenButler: Token Importance is Predictable}, 
+      author={Yash Akhauri and Ahmed F AbouElhamayed and Yifei Gao and Chi-Chih Chang and Nilesh Jain and Mohamed S. Abdelfattah},
+      year={2025},
+      eprint={2503.07518},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2503.07518}, 
+}
+```
