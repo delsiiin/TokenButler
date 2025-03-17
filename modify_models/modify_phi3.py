@@ -228,18 +228,34 @@ class Phi3AttentionExperimental(nn.Module):
                             mask_tensor = threshold_to_mask(unadj_importance_mask, perhead_thresholds, min_sparse_index, bsz, q_len, key_len)
                         else:
                             importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
-                            sorted_indices = torch.argsort(importance_mask, dim=-1, descending=True)
+                            _, sorted_indices = importance_mask.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
                             sorted_indices = sorted_indices[:, :, -q_len:, :]
-                            mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
-                        if self.sliding_window is not None:
-                            if not hasattr(self, "window_cache"):
-                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
-                                                                    sliding_window=self.sliding_window,
-                                                                    device=mask_tensor.device)
-                            window = self.window_cache.get_window(q_len, key_len)
-                            mask_tensor = enforce_sliding_window(mask_tensor, window)
+                            if q_len == 1:
+                                # initialize tensor of zeros with shape like sorted_indices
+                                mask_tensor = torch.zeros_like(importance_mask)
+                                sorted_indices = sorted_indices[:, :, :, int(self.sparse_aggression * key_len):]
+                                # scatter value float('-inf') at indexes in sorted_indices to mask_tensor
+                                mask_tensor.scatter_(-1, sorted_indices, float('-inf'))
+                                mask_tensor[:, :, :, :min_sparse_index] = 0.0
+                                if self.sliding_window is not None:
+                                    mask_tensor[:, :, :, -self.sliding_window:] = 0.0
+                                # import pdb; pdb.set_trace()
+                            else:
+                                mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
+                        # ### Threshold variance investigation
+                        # if self.sliding_window is not None:
+                        #     if not hasattr(self, "window_cache"):
+                        #         self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                        #                                             sliding_window=self.sliding_window,
+                        #                                             device=mask_tensor.device)
+                        #     window = self.window_cache.get_window(q_len, key_len)
+                        #     mask_tensor = enforce_sliding_window(mask_tensor, window)
                         final_mask = mask_tensor
-                        attn_weights = attn_weights + mask_tensor + attention_mask
+
+                        self.final_mask_investigate = final_mask
+                        attn_weights = attn_weights + attention_mask
+                        # if q_len == 1:
+                        attn_weights = attn_weights + mask_tensor
                     else:
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                         attn_weights = attn_weights + attention_mask
