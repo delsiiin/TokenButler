@@ -240,41 +240,10 @@ class LlamaAttentionExperimental(nn.Module):
                         importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
                         importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-                        # # Save heatmap for attn_weights[0][0] as png
-                        # import matplotlib.pyplot as plt
-                        # hidx = 4
-                        # # save it as a .png figure
-                        # plt.imshow(attn_weights[0][hidx].cpu().detach().numpy())
-                        # plt.savefig('attn_weights.png')
-                        # plt.cla()
-                        # plt.clf()
-                        # # save importance_mask as png
-                        # plt.imshow(importance_mask[0][hidx].cpu().detach().numpy())
-                        # plt.savefig('imp_weights.png')
-                        # # save it as a .png figure
-                        # # attetnion_weights + softmax
-                        # attn_weights = torch.softmax(attn_weights + attention_mask, dim=-1, dtype=torch.float32).to(value_states.dtype)
-                        # importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
-                        # # make top50 percentile 1
-                        # attn_weights = attn_weights.cpu().detach().numpy()
-                        # importance_mask = importance_mask.cpu().detach().numpy()
-                        # p95_attn = np.percentile(attn_weights[0][hidx], 95)
-                        # p95_imp = np.percentile(importance_mask[0][hidx], 95)
-                        # attn_weights[attn_weights > p95_attn] = 1
-                        # importance_mask[importance_mask > p95_imp] = 1
-
-                        # plt.imshow(attn_weights[0][hidx])
-                        # plt.savefig('attn_weights_causal.png')
-                        # plt.cla()
-                        # plt.clf()
-                        # # save importance_mask as png
-                        # plt.imshow(importance_mask[0][hidx])
-                        # plt.savefig('imp_weights_causal.png')
-                        # exit(0)
                         if self.calc_hitrates:
                             self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
-                                estimated_importance=importance_mask,
-                                true_importance=attn_weights,
+                                estimated_importance=nn.functional.softmax(importance_mask + attention_mask, dim=-1),
+                                true_importance=nn.functional.softmax(attn_weights + attention_mask, dim=-1),
                                 top_k_ratio=0.5
                             )
                         if self.calibrate_thresholds:
@@ -295,21 +264,6 @@ class LlamaAttentionExperimental(nn.Module):
                             mask_tensor = threshold_to_mask(unadj_importance_mask, perhead_thresholds, min_sparse_index, bsz, q_len, key_len)
                         else:
                             importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
-                            # if q_len != 1:
-                            #     torch.save(importance_mask, f"impmasks/prefill/imp_mask_pred_{self.layer_idx}.pt")
-                            # else:
-                            #     filename = f"impmasks/decode/imp_mask_pred_{self.layer_idx}.pt"
-                            #     if not os.path.exists(filename):
-                            #         data_dict = {0: importance_mask.cpu()}
-                            #     else:
-                            #         data_dict = torch.load(filename)
-                            #     new_key = len(data_dict)
-                            #     if new_key > 10:
-                            #         exit(0)
-                            #     data_dict[new_key] = importance_mask.cpu()
-                            #     torch.save(data_dict, filename)
-                            #     # torch.save(importance_mask, f"impmasks/decode/imp_mask_pred_{self.layer_idx}.pt")
-                                
                             _, sorted_indices = importance_mask.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
                             sorted_indices = sorted_indices[:, :, -q_len:, :]
                             if q_len == 1:
@@ -318,7 +272,9 @@ class LlamaAttentionExperimental(nn.Module):
                                 sorted_indices = sorted_indices[:, :, :, int(self.sparse_aggression * key_len):]
                                 # scatter value float('-inf') at indexes in sorted_indices to mask_tensor
                                 mask_tensor.scatter_(-1, sorted_indices, float('-inf'))
-                                mask_tensor[:, :, :, :16] = 0.0
+                                mask_tensor[:, :, :, :min_sparse_index] = 0.0
+                                if self.sliding_window is not None:
+                                    mask_tensor[:, :, :, -self.sliding_window:] = 0.0
                                 # import pdb; pdb.set_trace()
                             else:
                                 mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
@@ -333,10 +289,8 @@ class LlamaAttentionExperimental(nn.Module):
                         final_mask = mask_tensor
 
                         self.final_mask_investigate = final_mask
-                        # if q_len == 1:
-                        #     import pdb; pdb.set_trace()
                         attn_weights = attn_weights + attention_mask
-                        if q_len == 1: # Decode only sparsity
+                        if q_len == 1:
                             attn_weights = attn_weights + mask_tensor
                     else:
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -422,8 +376,8 @@ class LlamaAttentionExperimental(nn.Module):
 
                     if self.calc_hitrates:
                         self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
-                            estimated_importance=importance_mask,
-                            true_importance=attn_weights,
+                            estimated_importance=nn.functional.softmax(importance_mask + attention_mask, dim=-1),
+                            true_importance=nn.functional.softmax(attn_weights + attention_mask, dim=-1),
                             top_k_ratio=0.5
                         )
 

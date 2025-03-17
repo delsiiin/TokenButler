@@ -197,8 +197,8 @@ class Qwen2AttentionExperimental(nn.Module):
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                         if self.calc_hitrates:
                             self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
-                                estimated_importance=importance_mask,
-                                true_importance=attn_weights,
+                                estimated_importance=nn.functional.softmax(importance_mask + attention_mask, dim=-1),
+                                true_importance=nn.functional.softmax(attn_weights + attention_mask, dim=-1),
                                 top_k_ratio=0.5
                             )
                         if self.calibrate_thresholds:
@@ -275,16 +275,49 @@ class Qwen2AttentionExperimental(nn.Module):
                     importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
 
                     if self.lookahead == 0:
-                        self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
+                        if self.softmax_causal_loss_mse:
+                            self.msemagn_loss = self.mseloss(
+                                torch.softmax(attn_weights + attention_mask, dim=-1), 
+                                torch.softmax(importance_mask + attention_mask, dim=-1)
+                                )
+                        elif self.softmax_causal_loss_ce:
+                            target_dist = F.softmax(attn_weights + attention_mask, dim=-1).detach()
+                            pred_dist = F.softmax(importance_mask + attention_mask, dim=-1)
+                            ce = -(target_dist * (pred_dist + 1e-9).log()).sum(dim=-1)  
+                            self.msemagn_loss = ce
+                        else:
+                            self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
                     else:
                         self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
-                    self.msemagn_loss = (self.msemagn_loss).mean(dim=(-1, -2))
+                    if self.late_context_upweight:
+                        # Here, if we do seq_len_q with [1,1,seq_len_q,1], we focus on rewarding longer decodes more
+                        # but,  if we do seq_len_k with [1,1,1,seq_len_k], we focus on rewarding correctness on more recent tokens more
+                        # Since we want longer decode consistency, we will do seq_len_q
+                        seq_len_q = self.msemagn_loss.shape[-2]  # Lk
+                        weighting = torch.linspace(
+                            start=0.1, 
+                            end=1.0, 
+                            steps=seq_len_q, 
+                            device=self.msemagn_loss.device
+                        )
+                        weighting = weighting.view(1, 1, seq_len_q, 1)  # shape [1, 1, 1, Lk]
+                        self.msemagn_loss = self.msemagn_loss * weighting
+                        if self.softmax_causal_loss_mse:
+                            self.msemagn_loss = self.msemagn_loss.sum(dim=-2).mean(dim=-1)  # shape [B, H]
+                        else:
+                            self.msemagn_loss = self.msemagn_loss.mean(dim=(-2, -1))  # shape [B, H]
+                    else:
+                        if self.softmax_causal_loss_mse:
+                            self.msemagn_loss = self.msemagn_loss.sum(dim=-2).mean(dim=-1)  # shape [B, H]
+                        else:
+                            self.msemagn_loss = self.msemagn_loss.mean(dim=(-1, -2))
                     self.msemagn_loss = self.msemagn_loss.mean()
+
 
                     if self.calc_hitrates:
                         self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
-                            estimated_importance=importance_mask,
-                            true_importance=attn_weights,
+                            estimated_importance=nn.functional.softmax(importance_mask + attention_mask, dim=-1),
+                            true_importance=nn.functional.softmax(attn_weights + attention_mask, dim=-1),
                             top_k_ratio=0.5
                         )
 
