@@ -685,8 +685,8 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     avg_headhit_corr, avg_tokhit_corr = 0, 0
     train_progress = 0
     epoch_loss = 0.0
-    running_loss = 0.0
-    progress_bar = tqdm.tqdm(data_loader, desc="Training...", initial=step % len(data_loader))
+    running_loss = None
+    progress_bar = tqdm.tqdm(data_loader, desc="Training...", initial=step % len(data_loader), total=len(data_loader))
     for batch_idx, batch in enumerate(progress_bar):
         train_progress += 1
         try:
@@ -766,7 +766,10 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             optimizer.zero_grad()
 
             epoch_loss += mse_match_loss.item()
-            running_loss = (running_loss * step + mse_match_loss.item()) / (step + 1)
+            if running_loss is None:
+                running_loss = mse_match_loss.item()
+            else:
+                running_loss = (running_loss * step + mse_match_loss.item()) / (step + 1)
             progress_bar.set_description(f"Training... (Running Loss: {running_loss:.4e})")
             torch.cuda.empty_cache()
             gc.collect()
@@ -882,6 +885,9 @@ if __name__ == '__main__':
 
     # Predictor Design Related Arguments
     parser.add_argument('--lookahead', type=int, default=0)
+    parser.add_argument('--late_context_upweight', action='store_true', help='Upweight late context')
+    parser.add_argument('--softmax_causal_loss_mse', action='store_true', help='Change loss type to softmax causal MSE')
+    parser.add_argument('--softmax_causal_loss_ce', action='store_true', help='Change loss type to softmax causal probability based loss.')
     parser.add_argument('--sliding_window', type=int, default=None, help='Sliding window at eval IF comparing to SnapKV, set it to 16: Very Important!!!!!')
     parser.add_argument('--randomize_init', action='store_true', help='Very Experimental! Tries to train predictor on RANDOMLY initialized transformer...')
     parser.add_argument('--train_headpredictor', action='store_true', help='Train Head Predictor')
@@ -1038,6 +1044,9 @@ if __name__ == '__main__':
             module.intdim = args.intdim
             module.flash_attn = args.flash_attn
             module.train_headpredictor = args.train_headpredictor
+            module.late_context_upweight = args.late_context_upweight
+            module.softmax_causal_loss_mse = args.softmax_causal_loss_mse
+            module.softmax_causal_loss_ce = args.softmax_causal_loss_ce
             module.min_sparse_index = args.min_sparse_index
             module.lookahead = args.lookahead
             module.num_layers_pred = module.producer_frequency
@@ -1129,6 +1138,8 @@ if __name__ == '__main__':
                     if args.model_parallelism:
                         model_producer_layers[idx].to("cuda:0")
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     print(f"Error loading producer layer {idx}: {e}")
                     print("\n\nContinuing... !! Bad Perf If Unintentional !!\n\n")
             

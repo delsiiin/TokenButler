@@ -60,6 +60,9 @@ class LlamaAttentionExperimental(nn.Module):
         self.train_headpredictor = False
         self.calibrate_thresholds = False
         self.test_with_thresholds = False
+        self.late_context_upweight = False
+        self.softmax_causal_loss_mse = False
+        self.softmax_causal_loss_ce = False
         self.old_predictor = None
 
         if self.layer_idx > 0:
@@ -237,6 +240,37 @@ class LlamaAttentionExperimental(nn.Module):
                         importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
                         importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                        # # Save heatmap for attn_weights[0][0] as png
+                        # import matplotlib.pyplot as plt
+                        # hidx = 4
+                        # # save it as a .png figure
+                        # plt.imshow(attn_weights[0][hidx].cpu().detach().numpy())
+                        # plt.savefig('attn_weights.png')
+                        # plt.cla()
+                        # plt.clf()
+                        # # save importance_mask as png
+                        # plt.imshow(importance_mask[0][hidx].cpu().detach().numpy())
+                        # plt.savefig('imp_weights.png')
+                        # # save it as a .png figure
+                        # # attetnion_weights + softmax
+                        # attn_weights = torch.softmax(attn_weights + attention_mask, dim=-1, dtype=torch.float32).to(value_states.dtype)
+                        # importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
+                        # # make top50 percentile 1
+                        # attn_weights = attn_weights.cpu().detach().numpy()
+                        # importance_mask = importance_mask.cpu().detach().numpy()
+                        # p95_attn = np.percentile(attn_weights[0][hidx], 95)
+                        # p95_imp = np.percentile(importance_mask[0][hidx], 95)
+                        # attn_weights[attn_weights > p95_attn] = 1
+                        # importance_mask[importance_mask > p95_imp] = 1
+
+                        # plt.imshow(attn_weights[0][hidx])
+                        # plt.savefig('attn_weights_causal.png')
+                        # plt.cla()
+                        # plt.clf()
+                        # # save importance_mask as png
+                        # plt.imshow(importance_mask[0][hidx])
+                        # plt.savefig('imp_weights_causal.png')
+                        # exit(0)
                         if self.calc_hitrates:
                             self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
                                 estimated_importance=importance_mask,
@@ -261,9 +295,33 @@ class LlamaAttentionExperimental(nn.Module):
                             mask_tensor = threshold_to_mask(unadj_importance_mask, perhead_thresholds, min_sparse_index, bsz, q_len, key_len)
                         else:
                             importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
-                            sorted_indices = torch.argsort(importance_mask, dim=-1, descending=True)
+                            # if q_len != 1:
+                            #     torch.save(importance_mask, f"impmasks/prefill/imp_mask_pred_{self.layer_idx}.pt")
+                            # else:
+                            #     filename = f"impmasks/decode/imp_mask_pred_{self.layer_idx}.pt"
+                            #     if not os.path.exists(filename):
+                            #         data_dict = {0: importance_mask.cpu()}
+                            #     else:
+                            #         data_dict = torch.load(filename)
+                            #     new_key = len(data_dict)
+                            #     if new_key > 10:
+                            #         exit(0)
+                            #     data_dict[new_key] = importance_mask.cpu()
+                            #     torch.save(data_dict, filename)
+                            #     # torch.save(importance_mask, f"impmasks/decode/imp_mask_pred_{self.layer_idx}.pt")
+                                
+                            _, sorted_indices = importance_mask.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
                             sorted_indices = sorted_indices[:, :, -q_len:, :]
-                            mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
+                            if q_len == 1:
+                                # initialize tensor of zeros with shape like sorted_indices
+                                mask_tensor = torch.zeros_like(importance_mask)
+                                sorted_indices = sorted_indices[:, :, :, int(self.sparse_aggression * key_len):]
+                                # scatter value float('-inf') at indexes in sorted_indices to mask_tensor
+                                mask_tensor.scatter_(-1, sorted_indices, float('-inf'))
+                                mask_tensor[:, :, :, :16] = 0.0
+                                # import pdb; pdb.set_trace()
+                            else:
+                                mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
                         ### Threshold variance investigation
                         if self.sliding_window is not None:
                             if not hasattr(self, "window_cache"):
@@ -275,7 +333,11 @@ class LlamaAttentionExperimental(nn.Module):
                         final_mask = mask_tensor
 
                         self.final_mask_investigate = final_mask
-                        attn_weights = attn_weights + mask_tensor + attention_mask
+                        # if q_len == 1:
+                        #     import pdb; pdb.set_trace()
+                        attn_weights = attn_weights + attention_mask
+                        if q_len == 1: # Decode only sparsity
+                            attn_weights = attn_weights + mask_tensor
                     else:
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                         attn_weights = attn_weights + attention_mask
@@ -320,10 +382,42 @@ class LlamaAttentionExperimental(nn.Module):
                     importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
 
                     if self.lookahead == 0:
-                        self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
+                        if self.softmax_causal_loss_mse:
+                            self.msemagn_loss = self.mseloss(
+                                torch.softmax(attn_weights + attention_mask, dim=-1), 
+                                torch.softmax(importance_mask + attention_mask, dim=-1)
+                                )
+                        elif self.softmax_causal_loss_ce:
+                            target_dist = F.softmax(attn_weights + attention_mask, dim=-1).detach()
+                            pred_dist = F.softmax(importance_mask + attention_mask, dim=-1)
+                            ce = -(target_dist * (pred_dist + 1e-9).log()).sum(dim=-1)  
+                            self.msemagn_loss = ce
+                        else:
+                            self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
                     else:
                         self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
-                    self.msemagn_loss = (self.msemagn_loss).mean(dim=(-1, -2))
+                    if self.late_context_upweight:
+                        # Here, if we do seq_len_q with [1,1,seq_len_q,1], we focus on rewarding longer decodes more
+                        # but,  if we do seq_len_k with [1,1,1,seq_len_k], we focus on rewarding correctness on more recent tokens more
+                        # Since we want longer decode consistency, we will do seq_len_q
+                        seq_len_q = self.msemagn_loss.shape[-2]  # Lk
+                        weighting = torch.linspace(
+                            start=0.1, 
+                            end=1.0, 
+                            steps=seq_len_q, 
+                            device=self.msemagn_loss.device
+                        )
+                        weighting = weighting.view(1, 1, seq_len_q, 1)  # shape [1, 1, 1, Lk]
+                        self.msemagn_loss = self.msemagn_loss * weighting
+                        if self.softmax_causal_loss_mse:
+                            self.msemagn_loss = self.msemagn_loss.sum(dim=-2).mean(dim=-1)  # shape [B, H]
+                        else:
+                            self.msemagn_loss = self.msemagn_loss.mean(dim=(-2, -1))  # shape [B, H]
+                    else:
+                        if self.softmax_causal_loss_mse:
+                            self.msemagn_loss = self.msemagn_loss.sum(dim=-2).mean(dim=-1)  # shape [B, H]
+                        else:
+                            self.msemagn_loss = self.msemagn_loss.mean(dim=(-1, -2))
                     self.msemagn_loss = self.msemagn_loss.mean()
 
                     if self.calc_hitrates:
@@ -360,6 +454,7 @@ class LlamaAttentionExperimental(nn.Module):
             checkeverytime = self.test_with_thresholds
         if final_mask is not None:
             if self.effective_sparsity is None or checkeverytime:
+            # if True:
                 true_mask = final_mask + attention_mask
                 num_deact = true_mask.bool().sum(dim=-1)                   # Number of tokens disabled.
                 causally_deact = (attention_mask.bool()).sum(dim=-1).expand_as(num_deact)        # Number of tokens disabled causally anyway
@@ -367,7 +462,7 @@ class LlamaAttentionExperimental(nn.Module):
                 num_active = (~attention_mask.bool()).sum(dim=-1).expand_as(num_deact)    # Number of tokens active at this position if zero-sparsity
                 effective_sparsity = 100 * (additional_deact.float() / num_active.float()).mean().item()
                 self.effective_sparsity = effective_sparsity
-                print("Effective Sparsity:", effective_sparsity, "%\t Sequence Length:", q_len)
+                print(f"Layer {self.layer_idx}: Effective Sparsity:", effective_sparsity, "%\t Sequence Length:", q_len)
         if self.layer_idx == 0:
             if self.effective_sparsity is None:
                 self.effective_sparsity = 0.0
@@ -416,12 +511,12 @@ class LlamaAttentionExperimental(nn.Module):
                 else:
                     self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
         
-        if self.layer_idx == 31:
-            if q_len == 1:
-                self.dtok += 1
-                print(f"Primary Key-Value Shape: {past_key_value.predictor_primary_key[0].shape}, Importance: {past_key_value.predictor_importance_key[0].shape}, Tok-Decoded: {self.dtok}")
-            else:
-                self.dtok = 0
+        # if self.layer_idx == 31:
+        #     if q_len == 1:
+        #         self.dtok += 1
+        #         print(f"Primary Key-Value Shape: {past_key_value.predictor_primary_key[0].shape}, Importance: {past_key_value.predictor_importance_key[0].shape}, Tok-Decoded: {self.dtok}")
+        #     else:
+        #         self.dtok = 0
 
         if not output_attentions:
             attn_weights = None

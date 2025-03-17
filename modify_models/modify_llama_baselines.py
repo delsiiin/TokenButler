@@ -235,7 +235,25 @@ class LlamaAttentionExperimental(nn.Module):
                 oracle_attn_weights = oracle_attn_weights + attention_mask
                 oracle_attn_weights = nn.functional.softmax(oracle_attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
                 importance_mask = oracle_attn_weights.detach().float()
+                    # if q_len != 1:
+                    #     torch.save(importance_mask, f"impmasks/prefill/imp_mask_oracle_{self.layer_idx}.pt")
+                    # else:
+                    #     filename = f"impmasks/decode/imp_mask_oracle_{self.layer_idx}.pt"
+                    #     if not os.path.exists(filename):
+                    #         data_dict = {0: importance_mask.cpu()}
+                    #     else:
+                    #         data_dict = torch.load(filename)
+                    #     new_key = len(data_dict)
+                    #     if new_key > 10:
+                    #         exit(0)
+                    #     data_dict[new_key] = importance_mask.cpu()
+                    #     torch.save(data_dict, filename)
+                    # # if q_len != 1:
+                    # #     torch.save(importance_mask, f"impmasks/prefill/imp_mask_oracle_{self.layer_idx}.pt")
+                    # # else:
+                    # #     torch.save(importance_mask, f"impmasks/decode/imp_mask_oracle_{self.layer_idx}.pt")
                 importance_mask = torch.softmax(importance_mask, dim=-1, dtype=torch.float32)
+                    # # if q_len != 1: import pdb; pdb.set_trace()
                 if evalmode == "random":
                     importance_mask = torch.softmax(torch.rand_like(importance_mask) + attention_mask, dim=-1, dtype=torch.float32)
                 if evalmode in ["init_oracle", "lookahead_oracle"]:
@@ -270,6 +288,8 @@ class LlamaAttentionExperimental(nn.Module):
                         final_mask = mask_tensor
                         self.final_mask_investigate = final_mask
                         attn_wt_shape = attn_weights.shape
+                        # if q_len == 1:
+                        #     import pdb; pdb.set_trace()
                         if q_len != 1:
                             attn_weights = attn_weights + mask_tensor + attention_mask
                         else:

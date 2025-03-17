@@ -1,3 +1,26 @@
+### Late Context UpWeight Training 
+python main.py \
+    --proj_name TrainTokenButler \
+    --model_path meta-llama/Llama-3.2-3B \
+    --architecture llama \
+    --token_sparse_method fixed_40pc \
+    --model_mode finetune \
+    --finetune_dataset c4_realnewslike \
+    --train_subset_fac 4 \
+    --train_seqlen 1024 \
+    --eval_llm_mode ExpPred \
+    --result_file "DEBUG_L3_3B_2k_LC.csv" \
+    --wname DEBUG_L3_3B_2k_LC \
+    --pred_lr 1e-3 \
+    --dDash 16 \
+    --intdim 1024 \
+    --do_downstream_eval \
+    --task_list "winogrande,hellaswag,piqa,arc_easy" \
+    --eval_subset 1000 \
+    --late_context_upweight \
+    --eval_wk2_seqlen 1024 --no_wandb
+### Late Context UpWeight Training 
+
 
 ### deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 python main.py \

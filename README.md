@@ -1,5 +1,7 @@
 # TokenButler: Token Importance Is Predictable
 
+This project is still WIP and under improvement. Please checkout commit `d94fc426990089c351d062eb65005da2a8d115a2` for functional code!
+
 <div align="center">
   <img src="https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/tokenbutlerlogo.png?raw=true" width="50%" alt="TokenButler" />
 </div>

@@ -87,9 +87,14 @@ class PredictorDynamicCache(DynamicCache):
             self.predictor_importance_key[layer_idx] = key_states
         else:
             self.predictor_importance_key[layer_idx] = torch.cat(
-                [self.predictor_importance_key[layer_idx], key_states], dim=2
+                [self.predictor_importance_key[layer_idx], key_states], dim=-2
             )
         return self.predictor_importance_key[layer_idx]
+
+    @staticmethod
+    def _ensure_list_capacity(lst: list, idx: int, fill=None):
+        if len(lst) <= idx:
+            lst.extend([fill] * (idx + 1 - len(lst)))
 
     def crop(self, max_length: int):
         super().crop(max_length)
@@ -188,11 +193,6 @@ class PredictorDynamicCache(DynamicCache):
         self.predictor_importance_key = self._select_list_tensors(
             self.predictor_importance_key, indices
         )
-
-    @staticmethod
-    def _ensure_list_capacity(lst: list, idx: int, fill=None):
-        if len(lst) <= idx:
-            lst.extend([fill] * (idx + 1 - len(lst)))
 
     @staticmethod
     def _slice_list_tensors(
@@ -400,53 +400,55 @@ class TokenImportancePredictorAttentive(nn.Module):
             self.to(self.device)
             
         B, L, E = hidden_states.size()
+        # (Pdb) print(B, L, E)
+        # 1 422 3072
         
-        # Reduce hidden size
         hidden_states = hidden_states.to(self.input_proj.weight.dtype)
-        hidden_states_reduced = self.input_proj(hidden_states)  # [B, L, hidden_size_reduced]
+        hidden_states_reduced = self.input_proj(hidden_states)
+        # (Pdb) print(hidden_states_reduced.shape)
+        # torch.Size([1, 422, 384])
         # Compute q, k, v for attention
-        q = self.q_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]
-        k = self.k_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]
-        v = self.v_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]
-        # Reshape q, k, v to [B, num_heads, L, attn_head_dim]
-        q = q.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
-        k = k.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
-        v = v.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
+        q = self.q_proj_attn(hidden_states_reduced)
+        k = self.k_proj_attn(hidden_states_reduced)
+        v = self.v_proj_attn(hidden_states_reduced)
+        q = q.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
+        k = k.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
+        v = v.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
+        # (Pdb) print(q.shape, k.shape, v.shape)
+        # torch.Size([1, 24, 422, 16]) torch.Size([1, 24, 422, 16]) torch.Size([1, 24, 422, 16])
         if (past_key_value is not None
             and layer_idx < len(past_key_value.predictor_primary_key)
             and past_key_value.predictor_primary_key[layer_idx] is not None):
-            offset = past_key_value.predictor_primary_key[layer_idx].shape[2]  # old_k.shape[2]
+            offset = past_key_value.predictor_primary_key[layer_idx].shape[2] 
         else:
             offset = 0
 
-        # total seq length for new + old
         kv_seq_len = offset + L
 
-        # Step 2: build position_ids for just the new chunk [offset..offset+L-1]
         if position_ids is None:
-            # shape [B, L], e.g. [0..(offset+L-1)]
             position_ids = torch.arange(offset, offset + L, dtype=torch.long, device=self.device)
             position_ids = position_ids.unsqueeze(0).expand(B, L)
 
-        # Step 3: apply rotary to just the new chunk k,v with the correct offset
         cos, sin = self.rotary_emb_attn(v, position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        # (Pdb) print(v.shape, position_ids.shape)
+        # torch.Size([1, 24, 422, 16]) torch.Size([1, 422])
+        # (Pdb) print(cos.shape, sin.shape)
+        # torch.Size([1, 422, 16]) torch.Size([1, 422, 16])
 
-        # Step 4: ask the cache to append them.  Then re‐assign k, v to the full cat
         if use_cache and past_key_value is not None:
             k, v = past_key_value.update_predictor_primary(k.detach(), v.detach(), layer_idx)
-            kv_seq_len = k.size(2)  # now includes old + new
-
+            # print("k shape: ", k.shape, "\t v shape: ", v.shape)
+            kv_seq_len = k.size(2)  
         attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
-        attn_output = attn_output.to(q.dtype)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced)
+        attn_output = attn_output.to(q.dtype) # torch.Size([1, 422, 384])
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced) # torch.Size([1, 422, 384])
         attn_output = self.norm1(attn_output)
         ffn_output = self.ffn(attn_output)
-        # Temporary measure, till old predictor fully deprecated
         hidden_states = self.norm2(hidden_states + ffn_output)
-
+        # (Pdb) hidden_states.shape
+        # torch.Size([1, 422, 3072])
         B, L, E = hidden_states.size()
-        # Importance projections
         H = self.num_heads
         N = self.num_hidden_layers
 
@@ -454,23 +456,29 @@ class TokenImportancePredictorAttentive(nn.Module):
         q_importance = self.q_proj_importance(hidden_states_for_importance)
         k_importance = self.k_proj_importance(hidden_states_for_importance)
 
-        # Reshape and permute to [B, N, H, L, D']
         q_importance = q_importance.view(B, L, N, H, self.dDash).permute(0, 2, 3, 1, 4).contiguous()  # [B, N, H, L, D']
         k_importance = k_importance.view(B, L, N, H, self.dDash).permute(0, 2, 3, 1, 4).contiguous()  # [B, N, H, L, D']
-
-        # Flatten N and H for efficient computation
-        q_importance = q_importance.view(B * N * H, L, self.dDash)  # [BNH, L, D']
-        k_importance = k_importance.view(B * N * H, L, self.dDash)  # [BNH, L, D']
-
-        # Apply rotary positional embeddings
+        # (Pdb) print(q_importance.shape, k_importance.shape)
+        # torch.Size([1, 28, 24, 422, 16]) torch.Size([1, 28, 24, 422, 16])
+        q_importance = q_importance.view(B, N * H, L, self.dDash)  # [B, NH, L, D']
+        k_importance = k_importance.view(B, N * H, L, self.dDash)  # [B, NH, L, D']
+        # (Pdb) print(q_importance.shape, k_importance.shape)
+        # torch.Size([672, 422, 16]) torch.Size([672, 422, 16])
         cos, sin = self.rotary_emb_importance(k_importance, position_ids)
+        # (Pdb) print(cos.shape, sin.shape)
+        # torch.Size([1, 422, 16]) torch.Size([1, 422, 16])
         q_importance, k_importance = apply_rotary_pos_emb(q_importance, k_importance, cos, sin, position_ids)
+        # (Pdb) print(q_importance.shape, k_importance.shape)
+        # torch.Size([1, 672, 422, 16]) torch.Size([1, 672, 422, 16])
 
         if use_cache and past_key_value is not None:
             k_importance = past_key_value.update_predictor_importance(k_importance.detach(), layer_idx)
+            # print("k_importance shape: ", k_importance.shape, "\t q_importance shape: ", q_importance.shape)
             
-        k_importance = k_importance.view(B * H, N, -1, self.dDash)  # [BNH, L, D']
-        q_importance = q_importance.view(B * H, N, -1, self.dDash)  # [BH, N, L, D']
+        k_importance = k_importance.view(B * H, N, -1, self.dDash)
+        q_importance = q_importance.view(B * H, N, -1, self.dDash)
+        # (Pdb) print(q_importance.shape, k_importance.shape)
+        # torch.Size([24, 28, 422, 16]) torch.Size([24, 28, 422, 16])
         return q_importance, k_importance
 
 
@@ -583,7 +591,6 @@ class HeadImportancePredictor(nn.Module):
         Returns:
             torch.Tensor: Importance scores of shape [B, N, H, L, L].
         """
-        # Set device if not already set
         if self.device != hidden_states.device:
             self.device = hidden_states.device
             self.to(self.device)
@@ -591,50 +598,37 @@ class HeadImportancePredictor(nn.Module):
         B, L, E = hidden_states.size()
         if past_key_value is None:
             past_key_value = {}
-        # if L == 1:
-        #     import pdb; pdb.set_trace()
         past_primary = past_key_value.get('primary', None)
         # Reduce hidden size
         hidden_states = hidden_states.to(self.input_proj.weight.dtype)
-        hidden_states_reduced = self.input_proj(hidden_states)  # [B, L, hidden_size_reduced]
+        hidden_states_reduced = self.input_proj(hidden_states)
         # Compute q, k, v for attention
-        q = self.q_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]
-        k = self.k_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]
-        v = self.v_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]
-        # Reshape q, k, v to [B, num_heads, L, attn_head_dim]
-        q = q.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
-        k = k.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
-        v = v.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
-        # Compute kv_seq_len before concatenation
+        q = self.q_proj_attn(hidden_states_reduced)
+        k = self.k_proj_attn(hidden_states_reduced)
+        v = self.v_proj_attn(hidden_states_reduced)
+        q = q.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
+        k = k.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
+        v = v.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
         if past_primary is not None:
             past_L = past_primary[0].shape[2]
             kv_seq_len = past_L + L
         else:
             kv_seq_len = L
         
-        # Apply rotary positional embeddings based on kv_seq_len
         cos, sin = self.rotary_emb_attn(v, position_ids)
         if position_ids is None:
             position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=self.device)
             position_ids = position_ids.unsqueeze(0).expand(B, kv_seq_len)
         
         if past_primary is not None:
-            # Concatenate past k and v
-            k = torch.cat([past_primary[0], k], dim=2)  # [B, num_heads, past_L + L, attn_head_dim]
-            v = torch.cat([past_primary[1], v], dim=2)  # [B, num_heads, past_L + L, attn_head_dim]
+            k = torch.cat([past_primary[0], k], dim=2)
+            v = torch.cat([past_primary[1], v], dim=2)
         
-        # Apply rotary embeddings after concatenation
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
         
-        # Update cache if use_cache is True
         if use_cache:
             past_key_value['primary'] = (k.detach(), v.detach())
 
-        # if self.flash_attn:
-        #     sm_scale = 1.0 / math.sqrt(self.attn_head_dim)
-        #     attn_output = attention(q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16), True, sm_scale).to(q.dtype)
-        # else:
-        #     attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         attn_output = attn_output.to(q.dtype)
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced)
