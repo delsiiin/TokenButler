@@ -1,27 +1,3 @@
-### Late Context UpWeight Training 
-python main.py \
-    --proj_name TrainTokenButler \
-    --model_path meta-llama/Llama-3.2-3B \
-    --architecture llama \
-    --token_sparse_method fixed_40pc \
-    --model_mode finetune \
-    --finetune_dataset c4_realnewslike \
-    --train_subset_fac 4 \
-    --train_seqlen 1024 \
-    --eval_llm_mode ExpPred \
-    --result_file "DEBUG_L3_3B_2k_LC.csv" \
-    --wname DEBUG_L3_3B_2k_LC \
-    --pred_lr 1e-3 \
-    --dDash 16 \
-    --intdim 1024 \
-    --do_downstream_eval \
-    --task_list "winogrande,hellaswag,piqa,arc_easy" \
-    --eval_subset 1000 \
-    --late_context_upweight \
-    --eval_wk2_seqlen 1024 --no_wandb
-### Late Context UpWeight Training 
-
-
 ### deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 python main.py \
     --proj_name TrainTokenButler \
@@ -40,14 +16,15 @@ python main.py \
     --do_downstream_eval \
     --task_list "winogrande,hellaswag,piqa,arc_easy" \
     --eval_subset 1000 \
-    --eval_wk2_seqlen 1024
+    --eval_wk2_seqlen 1024 \
+    --softmax_causal_loss_ce
 
 ### Llama-3.2-1B Training Script
 python main.py \
     --proj_name TrainTokenButler \
     --model_path meta-llama/Llama-3.2-1B \
     --architecture llama \
-    --token_sparse_method fixed_10pc \
+    --token_sparse_method fixed_40pc \
     --model_mode finetune \
     --finetune_dataset c4_realnewslike \
     --train_subset_fac 800 \
@@ -59,9 +36,10 @@ python main.py \
     --dDash 16 \
     --intdim 512 \
     --do_downstream_eval \
-    --task_list "winogrande,triviaqa" \
+    --task_list "winogrande,hellaswag,piqa,arc_easy" \
     --eval_subset 1000 \
-    --eval_wk2_seqlen 1024
+    --eval_wk2_seqlen 1024 \
+    --softmax_causal_loss_ce
 
 
 ### Llama-3.2-3B Training Script
@@ -83,7 +61,8 @@ python main.py \
     --do_downstream_eval \
     --task_list "winogrande,hellaswag,piqa,arc_easy" \
     --eval_subset 1000 \
-    --eval_wk2_seqlen 1024
+    --eval_wk2_seqlen 1024 \
+    --softmax_causal_loss_ce
 
 
 ### Llama-2-7b-hf Training Script
@@ -106,6 +85,7 @@ python main.py \
     --task_list "winogrande,hellaswag,piqa,arc_easy" \
     --eval_subset 1000 \
     --eval_wk2_seqlen 1024 \
+    --softmax_causal_loss_ce
 
 ### Llama-3.1-8B Training Script
 python main.py \
@@ -125,7 +105,8 @@ python main.py \
     --do_downstream_eval \
     --task_list "winogrande,hellaswag,piqa,arc_easy" \
     --eval_subset 1000 \
-    --eval_wk2_seqlen 1024
+    --eval_wk2_seqlen 1024 \
+    --softmax_causal_loss_ce
   
 
   
