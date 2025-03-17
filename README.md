@@ -9,7 +9,7 @@ This project is still WIP and under improvement. Please checkout commit `d94fc42
 <br>
 <div align="center" style="line-height: 1;">
   <!-- Paper Badge -->
-  <a href="https://github.com/abdelfattah-lab/TokenButler/blob/main/TokenButler_Draft.pdf" target="_blank" style="margin: 2px;">
+  <a href="https://arxiv.org/abs/2503.07518" target="_blank" style="margin: 2px;">
     <img alt="Paper" 
          src="https://img.shields.io/badge/Paper-View-orange?logo=readthedocs&logoColor=white" 
          style="display: inline-block; vertical-align: middle;"/>
@@ -29,15 +29,14 @@ This project is still WIP and under improvement. Please checkout commit `d94fc42
 </div>
 <br>
 
+
+# Predictor Architecture
+
+![Predictor Architecture](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/mainfig.png)
+
 This repository contains code to train and evaluate 'token importance' predictors.
 
-All of our results, traces from experiments are located in `ablation_results/`
-
-Note: Our predictor design has improved since the arXiv paper release (We added a layer-norm to stabilize training). Further, to focus on the main predictor design and training-eval scripts, we have removed the ablation scripts. To reproduce the original results and predictor models, please checkout commit `0412fc24a3b770e4d82e6d7064a8172f24c5fcd3` and download the old models. 
-
-For the latest, new models, try the huggingface integration. [Wandb-Logs](https://wandb.ai/akhauriyash/TrainTokenButler) for trained models.
-
-## Huggingface Integration
+## Huggingface
 
 We support the following models directly through huggingface-transformers:
 
@@ -79,6 +78,12 @@ def set_sparsity(model, sparsity):
 model = set_sparsity(model, "fixed_60pc")
 ```
 
+All of our results, traces from experiments are located in `ablation_results/`
+
+Note: Our predictor design has improved since the arXiv paper release (We added a layer-norm to stabilize training). Further, to focus on the main predictor design and training-eval scripts, we have removed the ablation scripts. To reproduce the original results and predictor models, please checkout commit `0412fc24a3b770e4d82e6d7064a8172f24c5fcd3` and download the old models from [Drive Link](https://drive.google.com/drive/folders/1psNZ1SU0LaZJ-x5MQGH59CzYSmeT4yRf?usp=sharing).
+
+For the latest, new models, try the huggingface integration. [Wandb-Logs](https://wandb.ai/akhauriyash/TrainTokenButler) for trained models.
+
 ## Installation
 
 ```
@@ -88,8 +93,8 @@ python -m pip install -r requirements.txt
 ```
 
 ## Evaluation
-Please download our trained (old) TokenButler predictor models from this [Drive Link](https://drive.google.com/drive/folders/1psNZ1SU0LaZJ-x5MQGH59CzYSmeT4yRf?usp=sharing)
 
+Please download our trained (old) TokenButler predictor models from this [Drive Link](https://drive.google.com/drive/folders/1psNZ1SU0LaZJ-x5MQGH59CzYSmeT4yRf?usp=sharing)
 
 To evaluate, example scripts are provided in `scripts/eval_scan.sh`, checkout commit `0412fc24a3b770e4d82e6d7064a8172f24c5fcd3`. Decode-generation may not work at this commit.
 
@@ -98,11 +103,15 @@ To evaluate, example scripts are provided in `scripts/eval_scan.sh`, checkout co
 bash eval_scan.sh L3_3B_2k_1PC.csv L3_3B_2k_1PC ExpPred meta-llama/Llama-3.2-3B 1024 16 "<PATH TO CHECKPOINT>"
 ```
 
+# Custom Synthetic Task
+
+![Custom Synthetic Task](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/datasetfig.png)
+
 ### Modes supported: 
 - **TokenButler:** `ExpPred`
 - **Oracle:** `oracle`
-- **H2O:** `h2o_true` (Generation not supported)
-- **SnapKV:** `snapkv` (Generation not supported)
+- **H2O:** `h2o_true` (Generation not supported, prefill is 'decode simulated')
+- **SnapKV:** `snapkv` (Generation not supported, prefill is 'decode simulated')
 - **Quest:** `quest` (Generation not supported)
 
 
@@ -130,6 +139,9 @@ We provide scripts for the following models:
 Training requires 1 A6000 GPU for these variants. Longer-context training is possible using --model_parallelism
 
 # Reasoning Model TokenButler Results
+
+Model: DeepSeek-R1-Distill-Llama-8B-Butler
+
 |Method     |Sparsity (%)      |Perplexity|BBH Causal Judgement|MMLU-Pro           |
 |-----------|------------------|----------|--------------------|-------------------|
 |Dense      |0    |15.87     |0.55  |0.274 |
@@ -142,16 +154,16 @@ Training requires 1 A6000 GPU for these variants. Longer-context training is pos
 |Oracle     |49.8 |15.66     |0.54  |0.271 |
 |Oracle     |68.3 |15.71     |0.51  |0.271 |
 
-
-# Predictor Architecture
-
-![Predictor Architecture](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/mainfig.png)
-
-# Custom Synthetic Task
-
-![Custom Synthetic Task](https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/datasetfig.png)
-
 ## Citation
 
-
-Coming soon!
+```
+@misc{akhauri2025tokenbutlertokenimportancepredictable,
+      title={TokenButler: Token Importance is Predictable}, 
+      author={Yash Akhauri and Ahmed F AbouElhamayed and Yifei Gao and Chi-Chih Chang and Nilesh Jain and Mohamed S. Abdelfattah},
+      year={2025},
+      eprint={2503.07518},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2503.07518}, 
+}
+```
