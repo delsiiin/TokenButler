@@ -44,18 +44,19 @@ import pandas as pd
 from torch.cuda.amp import autocast
 import dotenv
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 import re
 
 scaler = GradScaler('cuda', enabled=True)
 global dowandb
 dotenv.load_dotenv()
 
-try:
-    hftoken = os.getenv("HFTOKEN")
-    login(token=hftoken)
-except:
-    print("Warning: HF-Login may be needed!")
-    pass
+# try:
+#     hftoken = os.getenv("HFTOKEN")
+#     login(token=hftoken)
+# except:
+#     print("Warning: HF-Login may be needed!")
+#     pass
 
 torch.backends.cuda.enable_flash_sdp(True)
 
@@ -111,7 +112,6 @@ def save_checkpoint(args, model, optimizer, scheduler, step, epoch, note=None):
 
     # Save the checkpoint
     torch.save({
-        'wandb_step': wandb.run.step,
         'step': step,
         'epoch': epoch,
         'model_state_dict': [layer_p.state_dict() for layer_p in model_producer_layer],
@@ -194,9 +194,7 @@ def run_long_bench_evaluation(model, tokenizer, args):
         results[dataset] = score
     if dowandb:
         for dataset in results:
-            wandb.log({
-                f"{dataset}_longbench_score": results[dataset]
-            })
+            tb_writer.add_scalar(f"{dataset}_longbench_score", results[dataset])
     return results
 
 def post_process(response, model_name):
@@ -671,9 +669,9 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         step = checkpoint['step']
-        current_step = checkpoint.get('wandb_step', 0)
+        current_step = checkpoint['step']
         for step in range(current_step):
-            wandb.log({}, step=step)
+            tb_writer.add_scalar(None, None, step)
         epoch = checkpoint.get('epoch', 0)
         step = checkpoint['step']
         print(f"Resumed at step {step}, epoch {epoch}")
@@ -778,7 +776,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 set_inference_mode(model, True)
                 eval_pplx, _ = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=True, config=config)
                 if dowandb:
-                    wandb.log({"traintime_pplx": eval_pplx})
+                    tb_writer.add_scalar('traintime_pplx', eval_pplx)
                 if args.do_downstream_eval:
                     if step % ( 4 * eval_freq ) == 0 and step > 10:
                         print("Evaluating on additional tasks...")
@@ -786,7 +784,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                         if dowandb:
                             for task_name, task_res in task_results.items():
                                 try:
-                                    wandb.log({f"{task_name}": task_res['acc,none']})
+                                    tb_writer.add_scalar(f"{task_name}", task_res['acc,none'])
                                 except KeyError:
                                     pass
                 if eval_pplx < min_wk2:
@@ -802,21 +800,19 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                     hloss = (100 * head_match_loss).item()
                 else:
                     hloss = 0
-                wandb.log({
-                    "MSE_Attn_Loss": mse_match_loss.item(),
-                    "Head_Loss": hloss,
-                    "Head Hit Acc": avg_headhit,
-                    "Token Hit Acc": avg_tokhit,
-                    "Head Hit Corr": avg_headhit_corr,
-                    "Token Hit Corr": avg_tokhit_corr,
-                    "task_loss": task_loss.item(),
-                    "MSE_Attn_RunningLoss": running_loss,
-                    "grad_norm": grad_norm.item(),  # Log gradient norm
-                    "learning_rate": scheduler.get_last_lr()[0],  # Log current learning rate
-                    "total_tokens": total_tok_seen,
-                    "stepskip": 1,
-                    "TrainProgress": float(train_progress / len(data_loader)),
-                })
+                tb_writer.add_scalar('MSE_Attn_Loss', mse_match_loss.item())
+                tb_writer.add_scalar('Head_Loss', hloss)
+                tb_writer.add_scalar('Head_Hit_Acc', avg_headhit)
+                tb_writer.add_scalar('Token_Hit_Acc', avg_tokhit)
+                tb_writer.add_scalar('Head_Hit_Corr', avg_headhit_corr)
+                tb_writer.add_scalar('Token_Hit_Corr', avg_tokhit_corr)
+                tb_writer.add_scalar('task_loss', task_loss.item())
+                tb_writer.add_scalar('MSE_Attn_RunningLoss', running_loss)
+                tb_writer.add_scalar('grad_norm', grad_norm.item())
+                tb_writer.add_scalar('learning_rate', scheduler.get_last_lr()[0])
+                tb_writer.add_scalar('total_tokens', total_tok_seen)
+                tb_writer.add_scalar('stepskip', 1)
+                tb_writer.add_scalar('TrainProgress', float(train_progress / len(data_loader)))
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -917,10 +913,7 @@ if __name__ == '__main__':
     print("IF EVALUATING: To compare with SnapKV Fairly, please set --sliding_window to 16 for experiments.")
 
     if dowandb:
-        if args.wname is not None:
-            wandb.init(project=args.proj_name, name=args.wname, config=args)
-        else:
-            wandb.init(project=args.proj_name, config=args)
+        tb_writer = SummaryWriter(comment=f"_{args.wname}")
 
     model_path = args.model_path
     testenc_wk2 = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
@@ -1072,9 +1065,7 @@ if __name__ == '__main__':
         avg_token_sparsity = sum(token_sparsity_list) / len(token_sparsity_list)
         args.net_sparsity = avg_token_sparsity
     if dowandb:
-        wandb.log({
-            "avg_token_sparsity": avg_token_sparsity
-        })
+        tb_writer.add_scalar('avg_token_sparsity', avg_token_sparsity)
     if not args.model_parallelism:
         model = model.cuda()
     try:
@@ -1097,11 +1088,9 @@ if __name__ == '__main__':
         print("Percentage Of Model Params in Head Predictor: ", hpt_perc)
 
         if dowandb:
-            wandb.log({
-                "TokenPredictorParam": tokpred_params,
-                "HeadPredictorParam": head_pred_params,
-                "TotalParamCount": total_params
-            })
+            tb_writer.add_scalar('TokenPredictorParam', tokpred_params)
+            tb_writer.add_scalar('HeadPredictorParam', head_pred_params)
+            tb_writer.add_scalar('TotalParamCount', total_params)
         print("="*10 + " Token Predictor " + "="*10)
         pprint.pprint({name: {'params': sum(p.numel() for p in module.parameters()), 
                     'percentage': sum(p.numel() for p in module.parameters()) / total_params * 100} 
@@ -1282,4 +1271,4 @@ if __name__ == '__main__':
         raise NotImplementedError
     
     if dowandb:
-        wandb.finish()
+        tb_writer.close()
