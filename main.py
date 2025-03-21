@@ -776,7 +776,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 set_inference_mode(model, True)
                 eval_pplx, _ = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=True, config=config)
                 if dowandb:
-                    tb_writer.add_scalar('traintime_pplx', eval_pplx)
+                    tb_writer.add_scalar('traintime_pplx', eval_pplx, step)
                 if args.do_downstream_eval:
                     if step % ( 4 * eval_freq ) == 0 and step > 10:
                         print("Evaluating on additional tasks...")
@@ -784,7 +784,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                         if dowandb:
                             for task_name, task_res in task_results.items():
                                 try:
-                                    tb_writer.add_scalar(f"{task_name}", task_res['acc,none'])
+                                    tb_writer.add_scalar(f"{task_name}", task_res['acc,none'], step)
                                 except KeyError:
                                     pass
                 if eval_pplx < min_wk2:
@@ -800,19 +800,19 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                     hloss = (100 * head_match_loss).item()
                 else:
                     hloss = 0
-                tb_writer.add_scalar('MSE_Attn_Loss', mse_match_loss.item())
-                tb_writer.add_scalar('Head_Loss', hloss)
-                tb_writer.add_scalar('Head_Hit_Acc', avg_headhit)
-                tb_writer.add_scalar('Token_Hit_Acc', avg_tokhit)
-                tb_writer.add_scalar('Head_Hit_Corr', avg_headhit_corr)
-                tb_writer.add_scalar('Token_Hit_Corr', avg_tokhit_corr)
-                tb_writer.add_scalar('task_loss', task_loss.item())
-                tb_writer.add_scalar('MSE_Attn_RunningLoss', running_loss)
-                tb_writer.add_scalar('grad_norm', grad_norm.item())
-                tb_writer.add_scalar('learning_rate', scheduler.get_last_lr()[0])
-                tb_writer.add_scalar('total_tokens', total_tok_seen)
-                tb_writer.add_scalar('stepskip', 1)
-                tb_writer.add_scalar('TrainProgress', float(train_progress / len(data_loader)))
+                tb_writer.add_scalar('MSE_Attn_Loss', mse_match_loss.item(), step)
+                tb_writer.add_scalar('Head_Loss', hloss, step)
+                tb_writer.add_scalar('Head_Hit_Acc', avg_headhit, step)
+                tb_writer.add_scalar('Token_Hit_Acc', avg_tokhit, step)
+                tb_writer.add_scalar('Head_Hit_Corr', avg_headhit_corr, step)
+                tb_writer.add_scalar('Token_Hit_Corr', avg_tokhit_corr, step)
+                tb_writer.add_scalar('task_loss', task_loss.item(), step)
+                tb_writer.add_scalar('MSE_Attn_RunningLoss', running_loss, step)
+                tb_writer.add_scalar('grad_norm', grad_norm.item(), step)
+                tb_writer.add_scalar('learning_rate', scheduler.get_last_lr()[0], step)
+                tb_writer.add_scalar('total_tokens', total_tok_seen, step)
+                tb_writer.add_scalar('stepskip', 1, step)
+                tb_writer.add_scalar('TrainProgress', float(train_progress / len(data_loader)), step)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1065,7 +1065,7 @@ if __name__ == '__main__':
         avg_token_sparsity = sum(token_sparsity_list) / len(token_sparsity_list)
         args.net_sparsity = avg_token_sparsity
     if dowandb:
-        tb_writer.add_scalar('avg_token_sparsity', avg_token_sparsity)
+        tb_writer.add_scalar('avg_token_sparsity', avg_token_sparsity, 0)
     if not args.model_parallelism:
         model = model.cuda()
     try:
@@ -1088,9 +1088,9 @@ if __name__ == '__main__':
         print("Percentage Of Model Params in Head Predictor: ", hpt_perc)
 
         if dowandb:
-            tb_writer.add_scalar('TokenPredictorParam', tokpred_params)
-            tb_writer.add_scalar('HeadPredictorParam', head_pred_params)
-            tb_writer.add_scalar('TotalParamCount', total_params)
+            tb_writer.add_scalar('TokenPredictorParam', tokpred_params, 0)
+            tb_writer.add_scalar('HeadPredictorParam', head_pred_params, 0)
+            tb_writer.add_scalar('TotalParamCount', total_params, 0)
         print("="*10 + " Token Predictor " + "="*10)
         pprint.pprint({name: {'params': sum(p.numel() for p in module.parameters()), 
                     'percentage': sum(p.numel() for p in module.parameters()) / total_params * 100} 
