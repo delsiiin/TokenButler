@@ -671,7 +671,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         step = checkpoint['step']
         current_step = checkpoint['step']
         for step in range(current_step):
-            tb_writer.add_scalar(None, None, step)
+            tb_writer.add_scalar("placeholder/step_sync", 0.0, step)
         epoch = checkpoint.get('epoch', 0)
         step = checkpoint['step']
         print(f"Resumed at step {step}, epoch {epoch}")
