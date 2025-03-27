@@ -173,4 +173,5 @@ csvresults/
 evalresults/
 expt_model/
 runs/
-ablation_results
+ablation_results/
+paramratios.csv
