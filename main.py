@@ -128,7 +128,7 @@ def get_producer_layers(model):
     """
     producer_modules = []
     for module in model.modules():
-        if module.__class__.__name__.endswith("AttentionExperimental") and module.layer_idx == 0:
+        if module.__class__.__name__.endswith("AttentionExperimental"):
             producer_modules.append(module)
     return producer_modules
     
@@ -242,7 +242,7 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
         input_ids = tokenizer(prompt, truncation=False, return_tensors="pt")
         context_length = input_ids.input_ids.shape[-1]
         embed_device = model.model.embed_tokens.weight.device
-        with autocast():
+        with torch.amp.autocast('cuda'):
             if dataset == "samsum":
                 output = model.generate(
                     **input_ids.to(embed_device),
@@ -302,7 +302,7 @@ def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=None, task_
     task_manager = lm_eval.tasks.TaskManager()
     print(f"Evaluating on tasks: {task_list}")
     # autocast
-    with autocast():
+    with torch.amp.autocast('cuda'):
         with torch.no_grad():
             results = lm_eval.simple_evaluate(
                 model=lm_obj,
@@ -376,7 +376,7 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
         batch = input_chunks[chunk].unsqueeze(0).to(model.device)
         if batch.size(1) < 2:
             continue
-        with autocast():
+        with torch.amp.autocast('cuda'):
             with torch.no_grad():
                 outputs = model(batch, use_cache=False)
                 logits = outputs.logits[:, :-1, :]
@@ -390,9 +390,10 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
             head_hit_rates, head_mean_rank_corr, head_max_rank_corr = [], [], []
             layeridx = 0
             for module in model.modules():
-                if module.__class__.__name__.endswith("AttentionExperimental") and module.layer_idx != 0:
+                if module.__class__.__name__.endswith("AttentionExperimental"):
                     try:
                         tok_hit_rates.append(module.tok_hit_acc)
+                        # print(f"Layer {layeridx} Token Hit Rate: {100*module.tok_hit_acc}%")
                         tok_mean_rank_corr.append(module.tok_mean_rank_corr)
                         tok_max_rank_corr.append(module.tok_max_rank_corr)
                         head_hit_rates.append(module.head_hit_acc)
@@ -519,8 +520,9 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     if args.model_parallelism:
         model_producer_layers = get_producer_layers(model)
         for producer_layer in model_producer_layers:
-            for param in producer_layer.sparse_token_predictor.parameters():
-                param = param.to('cuda:0')
+            if hasattr(producer_layer, "sparse_token_predictor"):
+                for param in producer_layer.sparse_token_predictor.parameters():
+                    param = param.to(producer_layer.q_proj.weight.device)
         for name, param in model.named_parameters():
             print(f"Layer: {name}, Device: {param.device}")
     max_seq_len = args.train_seqlen
@@ -617,11 +619,12 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         param.requires_grad = False
     producer_layers = get_producer_layers(model)
     for producer_layer in producer_layers:
-        for param in producer_layer.sparse_token_predictor.parameters():
-            param.requires_grad = True
-        if args.train_headpredictor:
-            for param in producer_layer.sparse_head_predictor.parameters():
+        if hasattr(producer_layer, "sparse_token_predictor"):
+            for param in producer_layer.sparse_token_predictor.parameters():
                 param.requires_grad = True
+            if args.train_headpredictor:
+                for param in producer_layer.sparse_head_predictor.parameters():
+                    param.requires_grad = True
     
     print("Set producer layer parameters to require gradients.")
     
@@ -720,7 +723,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                             mse_match_loss += module.msemagn_loss.to('cuda:0')
                         except:
                             mse_match_loss += 0
-                            import pdb; pdb.set_trace()
+                            # import pdb; pdb.set_trace()
                         module.msemagn_loss = 0
                         if args.train_headpredictor:
                             head_match_loss += module.headmsemagn_loss.to('cuda:0')
@@ -752,9 +755,10 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             step += 1
 
             for producer_layer in producer_layers:
-                grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_token_predictor.parameters(), max_norm=args.max_norm)
-                if args.train_headpredictor:
-                    head_grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_head_predictor.parameters(), max_norm=args.max_norm)
+                if hasattr(producer_layer, "sparse_token_predictor"):
+                    grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_token_predictor.parameters(), max_norm=args.max_norm)
+                    if args.train_headpredictor:
+                        head_grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_head_predictor.parameters(), max_norm=args.max_norm)
 
             if step % args.save_interval == 0:
                 save_checkpoint(args, model, optimizer, scheduler, step=step, epoch=epoch, note="intermediate")
@@ -830,7 +834,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 gc.collect()
                 import traceback
                 traceback.print_exc()
-                import pdb; pdb.set_trace()
+                # import pdb; pdb.set_trace()
                 continue
     avg_train_loss = epoch_loss / nsamples
     print(f"Average training loss for epoch {epoch+1}: {avg_train_loss:.4f}")
@@ -863,8 +867,10 @@ if __name__ == '__main__':
     parser.add_argument('--train_subset_fac', type=int, default=None)
     parser.add_argument('--max_norm', type=int, default=20, help='Max Norm')
     parser.add_argument('--pred_lr', type=float, default=1e-3, help='Predictor learning rate')
+    parser.add_argument('--train_dtype', type=str, default="fp32", help="dtype for training")
 
     # Evaluation Related Arguments
+    parser.add_argument('--eval_dtype', type=str, default="fp16", help="dtype for training")
     parser.add_argument('--eval_wk2_seqlen', type=int, default=512)
     parser.add_argument('--num_tok_per_page', type=int, default=16, help='Number of tokens per page for Quest')
     parser.add_argument('--no_wikitext_eval', action='store_true', help='Whether to perform Wikitext evaluation.')
@@ -943,11 +949,14 @@ if __name__ == '__main__':
         else:
             extra_param_device = 0
             device_map = {"model.embed_tokens": extra_param_device, "model.rotary_emb": extra_param_device, "model.norm": extra_param_device, "lm_head": extra_param_device}
-            device_num_layers = config.num_hidden_layers // (device_cnt - 1)
             for i in range(config.num_hidden_layers):
-                device_map[f"model.layers.{i}"] = (i % (device_cnt - 1)) + 1
-            device_map[f'model.layers.{0}'] = 0
-        dtype = torch.float16 if args.model_mode == "eval" else torch.float32
+                device_map[f"model.layers.{i}"] = i % device_cnt
+
+        dtype = args.eval_dtype if args.model_mode == "eval" else args.train_dtype
+        if dtype == "fp32":
+            dtype = torch.float32
+        elif dtype == "fp16":
+            dtype = torch.float16
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map=device_map,
@@ -1046,7 +1055,7 @@ if __name__ == '__main__':
             module.sliding_window = args.sliding_window
 
             if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
-                if module.layer_idx % args.producer_frequency == 0:
+                if module.layer_idx != 31:
                     module.update_predictor()
 
     if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
@@ -1125,7 +1134,7 @@ if __name__ == '__main__':
                 try:
                     model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
                     if args.model_parallelism:
-                        model_producer_layers[idx].to("cuda:0")
+                        model_producer_layers[idx].to(model.model.layers[idx].self_attn.q_proj.weight.device)
                 except Exception as e:
                     import traceback
                     traceback.print_exc()

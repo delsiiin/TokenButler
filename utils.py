@@ -244,7 +244,7 @@ def sorted_index_to_mask(
     gathered_mask = torch.gather(attention_mask_expanded, dim=-1, index=sorted_indices)
 
     # Step 4: cumsum along sorted dimension
-    gathered_mask_float = gathered_mask.float()
+    gathered_mask_float = gathered_mask
     cum_sum = torch.cumsum(gathered_mask_float, dim=-1)  # [B,H,q_len,key_len]
 
     # Step 5: Compare cumsum <= K_adjusted
@@ -253,15 +253,15 @@ def sorted_index_to_mask(
     selected_mask = (cum_sum <= K_broadcast)
 
     # Step 6: Prepare final mask_tensor with -inf by default
-    mask_tensor = torch.full_like(attention_mask_expanded.float(), float('-inf'))
+    mask_tensor = torch.full_like(attention_mask_expanded, 0)
 
     # Step 7: Scatter 0 where selected, -inf otherwise
-    scatter_values = torch.zeros_like(gathered_mask_float)
-    scatter_values = scatter_values.masked_fill(~selected_mask, float('-inf'))
+    scatter_values = torch.ones_like(gathered_mask_float)
+    scatter_values = scatter_values.masked_fill(~selected_mask, 0)
     mask_tensor.scatter_(-1, sorted_indices, scatter_values)
 
     # Step 8: Force the guaranteed front region unmasked
-    mask_tensor[:, :, :, :min_sparse_index] = 0.0
+    mask_tensor[:, :, :, :min_sparse_index] = 1
 
     # We do NOT forcibly unmask the trailing `sliding_window` here,
     # because we typically do it with a separate function that

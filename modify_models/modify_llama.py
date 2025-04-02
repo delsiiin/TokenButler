@@ -29,6 +29,77 @@ from triton_kernels.flash_attn_mse_loss import attention_mse_loss
 # torch.backends.cuda.enable_flash_sdp(enabled=True)
 # torch.backends.cuda.enable_mem_efficient_sdp(enabled=True)
 
+
+def temperature_softmax(logits, temperature, dim, dtype):
+    scaled_logits = logits / temperature
+    return F.softmax(scaled_logits, dim=dim, dtype=dtype)
+
+
+def get_A_mask(attn_weights, heavy_budget, recent_budget):
+    A_mask = torch.ones_like(attn_weights, dtype=torch.bool)
+    A_mask = torch.triu(A_mask, diagonal=-recent_budget)
+    A_mask[..., :heavy_budget] = 1
+    A_mask = torch.tril(A_mask, diagonal=0)
+    return A_mask
+
+def local_heavy_hitter_mask_nonoverlap(attn_weights, heavy_budget, recent_budget, no_padding_seq_length=None, multi_query=False):
+
+    # attn_weights (BS, head, query, keys)
+    dtype_attn_weights = attn_weights.dtype
+    seq_length = attn_weights.shape[-1]
+    if no_padding_seq_length is None:
+        padding_length = 0
+    else:
+        raise NotImplementedError
+        padding_length = seq_length - no_padding_seq_length
+
+    offset = torch.finfo(attn_weights.dtype).min
+    tmp_attn = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype_attn_weights)
+
+    accumulated_attention_score = torch.sum(tmp_attn[:,:,padding_length:heavy_budget+recent_budget+padding_length,:], dim=-2) #(head, keys)
+    accumulated_attention_score[:,:,heavy_budget+recent_budget+padding_length:] = 0
+    accumulated_attention_score[:,:,:padding_length] = 0
+
+    mask_bottom = torch.zeros_like(attn_weights, dtype=torch.bool)
+    if multi_query:
+        mask_bottom = mask_bottom[:,0].unsqueeze(1) #B1SS
+        accumulated_attention_score = accumulated_attention_score.sum(dim=1, keepdim=True) #B1S
+    mask_bottom[:,:, padding_length:heavy_budget+recent_budget+padding_length, padding_length:heavy_budget+recent_budget+padding_length] = True
+
+    for token_index in range(heavy_budget+recent_budget+padding_length, seq_length):
+        
+        tmp_attn_index = nn.functional.softmax(attn_weights[:,:,token_index,:], dim=-1, dtype=torch.float32).to(dtype_attn_weights)
+        if multi_query:
+            tmp_attn_index = tmp_attn_index.sum(dim=1, keepdim=True) #B1S
+        _, tmp_topk_index = accumulated_attention_score[..., :token_index-recent_budget].topk(k=heavy_budget, dim=-1)
+        zeros_index = torch.zeros_like(tmp_attn_index, dtype=torch.bool)
+        mask_bottom_index = zeros_index.scatter(-1, tmp_topk_index, True) #(head, keys)
+        
+        mask_bottom_index[:, : , token_index-recent_budget:token_index+1] = True
+
+        mask_bottom[:,:,token_index,:] = mask_bottom_index
+        accumulated_attention_score += tmp_attn_index
+        accumulated_attention_score = accumulated_attention_score * mask_bottom_index
+    
+    return mask_bottom
+
+
+def get_h2o_mask(attn_weights, heavy_budget, recent_budget, multi_query):
+    if heavy_budget > 0:
+        mask_bottom = local_heavy_hitter_mask_nonoverlap(attn_weights, heavy_budget, recent_budget, multi_query=multi_query) # Default: No padding applied to input
+    else:
+        mask_bottom = torch.zeros_like(attn_weights, dtype=torch.bool)
+    if multi_query:
+        ones = torch.ones_like(mask_bottom, dtype=torch.bool)
+    else:
+        ones = torch.ones_like(attn_weights, dtype=torch.bool)
+    ones = torch.triu(ones, diagonal=-recent_budget)
+    mask_bottom = torch.logical_or(mask_bottom, ones)
+
+    mask_bottom = torch.tril(mask_bottom, diagonal=0)
+
+    return mask_bottom
+
 class LlamaAttentionExperimental(nn.Module):
     def __init__(self, config: LlamaConfig, producer=None, layer_idx=0):
         super().__init__()
@@ -70,13 +141,9 @@ class LlamaAttentionExperimental(nn.Module):
             self.msemagn_loss = None
             self.headmseloss = MSELoss(reduction='none')
             self.headmsemagn_loss = None
+
+            self.merge_mseloss = MSELoss(reduction='none')
         
-        if self.producer is None:  # This is the producer layer
-            self.q_importance = None  # Shared mask across layers during inference
-            self.k_importance = None
-            self.head_importances = None
-            self.actmagn_masklist = {}
-            self.available_tokens = {}
 
         # Attention setup
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
@@ -87,15 +154,15 @@ class LlamaAttentionExperimental(nn.Module):
         
     def update_predictor(self):
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
-            self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
+            self.config, self.pred_hid_size, self.num_heads, self.num_hidden_layers, dropout=0.1, dDash = self.dDash, \
             intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor
-        ).to('cuda:0')
+        ).to(self.q_proj.weight.device)
         self.sparse_token_predictor.flash_attn = self.flash_attn
         if self.train_headpredictor:
             self.sparse_head_predictor = HeadImportancePredictor(
-                self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
+                self.config, self.pred_hid_size, self.num_heads, self.num_hidden_layers, dropout=0.1, dDash = self.dDash, \
                 intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor
-            ).to('cuda:0')
+            ).to(self.q_proj.weight.device)
             self.sparse_head_predictor.flash_attn = self.flash_attn
 
     def set_token_sparsity(self):
@@ -235,9 +302,9 @@ class LlamaAttentionExperimental(nn.Module):
             with torch.no_grad():
                 if evalmode == "ExpPred":
                     if self.layer_idx > 0:
-                        q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
-                        k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
-                        importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
+                        q_importance_tensor = self.producer.q_importance.float().to(query_states.device) # [BH, Lq, D']
+                        k_importance_tensor = self.producer.k_importance.float().to(key_states.device) # [BH, Lk, D']
+                        importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.head_dim // self.attn_reduce_factor) # [BH, Lq, Lk]
                         importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                         if self.calc_hitrates:
@@ -263,21 +330,80 @@ class LlamaAttentionExperimental(nn.Module):
                             perhead_thresholds = self.tok_calibration_set[self.layer_idx - 1].to(unadj_importance_mask.device) # 0 does not have calibration data.
                             mask_tensor = threshold_to_mask(unadj_importance_mask, perhead_thresholds, min_sparse_index, bsz, q_len, key_len)
                         else:
-                            importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
-                            _, sorted_indices = importance_mask.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
-                            sorted_indices = sorted_indices[:, :, -q_len:, :]
-                            if q_len == 1:
-                                # initialize tensor of zeros with shape like sorted_indices
-                                mask_tensor = torch.zeros_like(importance_mask)
-                                sorted_indices = sorted_indices[:, :, :, int(self.sparse_aggression * key_len):]
-                                # scatter value float('-inf') at indexes in sorted_indices to mask_tensor
-                                mask_tensor.scatter_(-1, sorted_indices, float('-inf'))
-                                mask_tensor[:, :, :, :min_sparse_index] = 0.0
-                                if self.sliding_window is not None:
-                                    mask_tensor[:, :, :, -self.sliding_window:] = 0.0
-                                # import pdb; pdb.set_trace()
+
+                            if self.lookahead == 0:
+                                if self.softmax_causal_loss_mse:
+                                    self.msemagn_loss = self.mseloss(
+                                        torch.softmax(attn_weights + attention_mask, dim=-1), 
+                                        torch.softmax(importance_mask + attention_mask, dim=-1)
+                                        )
+                                elif self.softmax_causal_loss_ce:
+                                    target_dist = F.softmax(attn_weights + attention_mask, dim=-1).detach()
+                                    pred_dist = F.softmax(importance_mask + attention_mask, dim=-1)
+                                    ce = -(target_dist * (pred_dist + 1e-9).log()).sum(dim=-1)  
+                                    self.msemagn_loss = ce
+                                else:
+                                    self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
                             else:
-                                mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
+                                self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
+            
+                            if self.softmax_causal_loss_mse:
+                                self.msemagn_loss = self.msemagn_loss.sum(dim=-2).mean(dim=-1)  # shape [B, H]
+                            else:
+                                self.msemagn_loss = self.msemagn_loss.mean(dim=(-1, -2))
+                            self.msemagn_loss = self.msemagn_loss.mean()
+
+                            # importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
+                            # _, sorted_indices = importance_mask.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
+                            # sorted_indices = sorted_indices[:, :, -q_len:, :]
+                            # if q_len == 1:
+                            #     # initialize tensor of zeros with shape like sorted_indices
+                            #     mask_tensor = torch.zeros_like(importance_mask)
+                            #     sorted_indices = sorted_indices[:, :, :, int(self.sparse_aggression * key_len):]
+                            #     # scatter value float('-inf') at indexes in sorted_indices to mask_tensor
+                            #     mask_tensor.scatter_(-1, sorted_indices, float('-inf'))
+                            #     mask_tensor[:, :, :, :min_sparse_index] = 0.0
+                            #     if self.sliding_window is not None:
+                            #         mask_tensor[:, :, :, -self.sliding_window:] = 0.0
+                            #     # import pdb; pdb.set_trace()
+                            # else:
+                            #     mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
+                        
+                            # merge attn
+                            # importance_mask_pred = torch.softmax(importance_mask + attention_mask, dim=-1)
+                            # _, sorted_indices = importance_mask_pred.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
+                            # sorted_indices = sorted_indices[:, :, -q_len:, :]
+                            # if q_len == 1:
+                            #     # initialize tensor of zeros with shape like sorted_indices
+                            #     mask_tensor = torch.ones_like(importance_mask_pred)
+                            #     sorted_indices = sorted_indices[:, :, :, int(self.sparse_aggression * key_len):]
+                            #     # scatter value float('-inf') at indexes in sorted_indices to mask_tensor
+                            #     mask_tensor.scatter_(-1, sorted_indices, 0)
+                            #     mask_tensor[:, :, :, :min_sparse_index] = 1
+                            #     if self.sliding_window is not None:
+                            #         mask_tensor[:, :, :, -self.sliding_window:] = 1
+                            #     # import pdb; pdb.set_trace()
+                            # else:
+                            #     mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
+        
+                            mask_tensor = get_A_mask(importance_mask, 4, 200)
+
+                            # mask_tensor = mask_tensor.bool()
+
+                            attn_weights_comp = (attn_weights * mask_tensor) + ((~mask_tensor) * torch.finfo(attn_weights.dtype).min)
+                            
+                            # attn_weights_comp_lse = torch.logsumexp(attn_weights_comp, -1, keepdim=True)
+                            
+                            merge_mask = attention_mask.bool() * (~mask_tensor)
+
+                            merge_mask = merge_mask.bool()
+
+                            importance_mask = importance_mask * merge_mask
+                        
+                            importance_mask = importance_mask * merge_mask + attn_weights_comp * (~merge_mask)
+
+                            attn_weights = importance_mask
+                        
                         # ### Threshold variance investigation
                         # if self.sliding_window is not None:
                         #     if not hasattr(self, "window_cache"):
@@ -286,16 +412,16 @@ class LlamaAttentionExperimental(nn.Module):
                         #                                             device=mask_tensor.device)
                         #     window = self.window_cache.get_window(q_len, key_len)
                         #     mask_tensor = enforce_sliding_window(mask_tensor, window)
-                        final_mask = mask_tensor
+                        # final_mask = mask_tensor
 
-                        self.final_mask_investigate = final_mask
-                        attn_weights = attn_weights + attention_mask
+                        # self.final_mask_investigate = final_mask
+                        # attn_weights = attn_weights + attention_mask
                         # if q_len == 1:
                         # During train-time, we want to keep this off, all our train-evals are 1 decode step focused
                         # not generation focused. So, we still want to assess prefill sparsity. 
                         # However, at inference time (generation), we should only use mask_tensor
                         # when q_len == 1
-                        attn_weights = attn_weights + mask_tensor
+                        # attn_weights = attn_weights + mask_tensor
                     else:
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                         attn_weights = attn_weights + attention_mask
@@ -309,10 +435,8 @@ class LlamaAttentionExperimental(nn.Module):
                 if self.layer_idx > 0:
                     # Token hit-rates cannot be calculated if using flash attention.
                     self.tok_hit_acc = 0
-                    q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
-                    k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
-                    q_importance_tensor = q_importance_tensor.view(bsz, self.num_heads, q_len, self.dDash)
-                    k_importance_tensor = k_importance_tensor.view(bsz, self.num_heads, key_len, self.dDash)
+                    q_importance_tensor = self.producer.q_importance.float().to(query_states.device) # [BH, Lq, D']
+                    k_importance_tensor = self.producer.k_importance.float().to(key_states.device) # [BH, Lk, D']
                     device_index = query_states.device.index
                     assert self.lookahead == 0, "Lookahead not supported with flash attention yet. Please disable --flash_attn"
                     with torch.cuda.device(device_index):
@@ -332,11 +456,12 @@ class LlamaAttentionExperimental(nn.Module):
                 else:
                     attn_output = torch.nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=None, is_causal=True)
             else:
+                min_sparse_index = self.min_sparse_index
                 attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)   
                 if self.layer_idx > 0:
-                    q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
-                    k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
-                    importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
+                    q_importance_tensor = self.producer.q_importance.float().to(query_states.device) # [BH, Lq, D']
+                    k_importance_tensor = self.producer.k_importance.float().to(key_states.device) # [BH, Lk, D']
+                    importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.head_dim // self.attn_reduce_factor) # [BH, Lq, Lk]
                     importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
 
                     if self.lookahead == 0:
@@ -385,10 +510,65 @@ class LlamaAttentionExperimental(nn.Module):
                             top_k_ratio=0.5
                         )
 
-                if attention_mask is not None:
-                    attn_weights = attn_weights + attention_mask
-                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
-                attn_output = torch.matmul(attn_weights, value_states)
+                    # merge attn
+                    # importance_mask_pred = torch.softmax(importance_mask + attention_mask, dim=-1)
+                    # _, sorted_indices = importance_mask_pred.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
+                    # sorted_indices = sorted_indices[:, :, -q_len:, :]
+                    # if q_len == 1:
+                    #     # initialize tensor of zeros with shape like sorted_indices
+                    #     mask_tensor = torch.ones_like(importance_mask_pred)
+                    #     sorted_indices = sorted_indices[:, :, :, int(self.sparse_aggression * key_len):]
+                    #     # scatter value float('-inf') at indexes in sorted_indices to mask_tensor
+                    #     mask_tensor.scatter_(-1, sorted_indices, 0)
+                    #     mask_tensor[:, :, :, :min_sparse_index] = 1
+                    #     if self.sliding_window is not None:
+                    #         mask_tensor[:, :, :, -self.sliding_window:] = 1
+                    #     # import pdb; pdb.set_trace()
+                    # else:
+                    #     mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
+  
+                    # mask_tensor = mask_tensor.bool()
+
+                    mask_tensor = get_A_mask(importance_mask, 4, 200)
+
+                    attn_weights_comp = (attn_weights * mask_tensor) + ((~mask_tensor) * torch.finfo(attn_weights.dtype).min)
+                    
+                    # attn_weights_comp_lse = torch.logsumexp(attn_weights_comp, -1, keepdim=True)
+                    
+                    merge_mask = attention_mask.bool() * (~mask_tensor)
+
+                    merge_mask = merge_mask.bool()
+
+                    importance_mask = importance_mask * merge_mask
+                    
+                    # print(torch.min(importance_mask.sum(dim=-1, keepdim=True)), 111111111111)
+                    # print(torch.min(importance_mask), 22222222222222)
+
+                    # predictor_lse = torch.log(importance_mask.sum(dim=-1, keepdim=True) + 1e-6)
+                    # norm_factor_lse = torch.logaddexp(predictor_lse, attn_weights_comp_lse)
+                    # importance_mask = (torch.log(importance_mask + 1e-6) * merge_mask) + ((~merge_mask) * attn_weights_comp)
+                    # importance_mask = torch.exp(importance_mask - norm_factor_lse)
+
+                    importance_mask = importance_mask * merge_mask + attn_weights_comp * (~merge_mask)
+
+                    importance_mask = torch.softmax(importance_mask, dim=-1, dtype=torch.float32).to(value_states.dtype)
+
+                    # importance_mask = temperature_softmax(importance_mask, 1, dim=-1, dtype=torch.float32).to(value_states.dtype)
+
+                    if attention_mask is not None:
+                        attn_weights = attn_weights + attention_mask
+                    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
+                    attn_output = torch.matmul(attn_weights, value_states)
+
+                    merge_mseloss = self.merge_mseloss(importance_mask, attn_weights).sum(dim=-2).mean(dim=-1).mean()
+                    self.msemagn_loss += merge_mseloss
+                    
+                else:
+
+                    if attention_mask is not None:
+                        attn_weights = attn_weights + attention_mask
+                    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
+                    attn_output = torch.matmul(attn_weights, value_states)
 
         if self.layer_idx > 0 and self.train_headpredictor:
             head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency].float().to(attn_output.device)
@@ -435,7 +615,7 @@ class LlamaAttentionExperimental(nn.Module):
         else:
             attn_output = self.o_proj(attn_output)
 
-        if self.producer is None:
+        if self.layer_idx != 31:
             try:
                 q_importance, k_importance = self.sparse_token_predictor(
                     hidden_states,
@@ -454,8 +634,8 @@ class LlamaAttentionExperimental(nn.Module):
                         use_cache=use_cache
                     )
                     head_importances = head_importances.view(bsz, q_len, self.num_heads, self.num_hidden_layers) # [B L H N]
-                q_len = attn_output.size(1)
-                k_len = k_importance.size(-1)
+                # q_len = attn_output.size(1)
+                # k_len = k_importance.size(-1)
             except:
                 print(traceback.format_exc())
                 import pdb; pdb.set_trace()
@@ -480,38 +660,57 @@ class LlamaAttentionExperimental(nn.Module):
             attn_weights = None
         return attn_output, attn_weights
 
+
 def convert_kvcache_experimental(model, config, producer_frequency):
-    producer_layer = None
-    producer_layer_device = None
+
+    previous_layer = None  
     layer_counter = {'idx': 0}
 
     def recurse_convert(parent_module):
-        nonlocal producer_layer
-        nonlocal producer_layer_device
+        nonlocal previous_layer
         for name, module in parent_module._modules.items():
             if len(list(module.children())) > 0:
                 recurse_convert(module)
             if isinstance(module, LlamaAttention):
-                device = next(module.parameters()).device
                 dtype = next(module.parameters()).dtype
-                if layer_counter['idx'] % producer_frequency == 0:
-                    new_module = LlamaAttentionExperimental(config).to(dtype).to(device)
-                    producer_layer = new_module
-                    producer_layer_device = device
+
+                if previous_layer is None:
+                    # 第一层没有前置 producer
+                    new_module = LlamaAttentionExperimental(config).to(dtype)
+                    previous_layer = new_module
+                    
                 else:
+                    # 设置 producer 为上一层
                     new_module = LlamaAttentionExperimental(
                         config,
-                        producer=producer_layer,
+                        producer=previous_layer,
                         layer_idx=layer_counter['idx']
-                    ).to(dtype).to(device)
+                    ).to(dtype)
+                    previous_layer = new_module
+                    
                 new_module.load_state_dict(module.state_dict(), strict=False)
-                is_producer = layer_counter['idx'] % producer_frequency == 0
-                if is_producer:
-                    print(f"Converted Producer layer '{name}' to LlamaAttentionExperimental at layer index {layer_counter['idx']}")
-                else:
-                    print(f"Converted layer '{name}' to LlamaAttentionExperimental at layer index {layer_counter['idx']}")
+                print(f"Converted layer '{name}' to LlamaAttentionExperimental at layer index {layer_counter['idx']}")
+
                 parent_module._modules[name] = new_module
+               
                 layer_counter['idx'] += 1
+
+    def move_self_attn_to_mlp_device(model):
+        for i, layer in enumerate(model.model.layers):
+            # 获取当前层 mlp 模块任意一个参数所在的设备
+            mlp_device = next(layer.mlp.parameters()).device
+            
+            # 将 self_attn 模块移动到 mlp 对应的设备上
+            layer.self_attn.q_proj = layer.self_attn.q_proj.to(mlp_device)
+            layer.self_attn.k_proj = layer.self_attn.k_proj.to(mlp_device)
+            layer.self_attn.v_proj = layer.self_attn.v_proj.to(mlp_device)
+            layer.self_attn.o_proj = layer.self_attn.o_proj.to(mlp_device)
+
+            # layer.self_attn = layer.self_attn.to(mlp_device)
+
     recurse_convert(model)
-    producer_layer = producer_layer.to(producer_layer_device)
+
+    move_self_attn_to_mlp_device(model)
+
     return model
+
