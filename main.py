@@ -78,8 +78,8 @@ def save_model(args, model, note=None):
     if note is not None:
         model_savepath_name += "_" + note
     print(f"Model will be saved at: {model_savepath_name}")
-    model_producer_layer = get_producer_layers(model)
-    torch.save([layer_p.state_dict() for layer_p in model_producer_layer], model_savepath_name + ".pt")
+    model_producer_layer = model.model.sparse_token_predictors
+    torch.save(model_producer_layer.state_dict(), model_savepath_name + ".pt")
 
 def save_checkpoint(args, model, optimizer, scheduler, step, epoch, note=None):
     """
@@ -107,14 +107,14 @@ def save_checkpoint(args, model, optimizer, scheduler, step, epoch, note=None):
 
     # Append step and epoch to the file name for clarity
     checkpoint_file_name = f"{file_name[-40:]}"
-    model_producer_layer = get_producer_layers(model)
+    model_producer_layer = model.model.sparse_token_predictors
     checkpoint_path = os.path.join(folder_path, f"{checkpoint_file_name}.pt")
 
     # Save the checkpoint
     torch.save({
         'step': step,
         'epoch': epoch,
-        'model_state_dict': [layer_p.state_dict() for layer_p in model_producer_layer],
+        'model_state_dict': model_producer_layer.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict()
     }, checkpoint_path)
@@ -142,7 +142,7 @@ def set_inference_mode(model, mode: bool):
         mode (bool): The mode to set (True for inference, False for training).
     """
     for module in model.modules():
-        if module.__class__.__name__.endswith("AttentionExperimental"):
+        if module.__class__.__name__.endswith("Attention"):
             module.inference_mode = mode
 
 def run_long_bench_evaluation(model, tokenizer, args):
@@ -276,7 +276,7 @@ def patched_prepare_cache_for_generation(
         model_kwargs["past_key_values"] = PredictorDynamicCache()
     return model_kwargs
 
-def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=None, task_list=["arc_easy", "hellaswag"], limit=None, flash_attn=False, train_headpredictor=False):
+def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=None, task_list=["arc_easy", "hellaswag"], limit=None, flash_attn=False):
 
     for module in model.modules():
         module.flash_attn = False
@@ -315,9 +315,7 @@ def run_lm_eval_zero_shot(model, tokenizer, batch_size=1, max_length=None, task_
     print(res)
     for module in model.modules():
         module.flash_attn = flash_attn
-        if hasattr(module, 'is_head_predictor'):
-            if train_headpredictor == False:
-                module.flash_attn = False
+        module.flash_attn = False
     return results['results']
 
 def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=False, config=None):
@@ -356,7 +354,7 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
     input_chunks = input_ids.split(max_seq_len)
 
     for module in model.modules():
-        if module.__class__.__name__.endswith("AttentionExperimental"):
+        if module.__class__.__name__.endswith("Attention"):
             module.calc_hitrates = True
             module.calibrate_thresholds = args.calibrate_thresholds
             module.test_with_thresholds = args.test_with_thresholds
@@ -367,7 +365,6 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
     progress_bar = tqdm.tqdm(range(num_chunks), desc="Evaluating Wikitext-2")
     losses = []
     avg_tok_hit_rate = []
-    avg_head_hit_rate = []
     threshold_mean = []
     true_threshmean = []
     effective_sparsity_list = [] 
@@ -387,18 +384,14 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
                 losses.append(loss.item())
                 total_tokens += target.numel()
             tok_hit_rates, tok_mean_rank_corr, tok_max_rank_corr = [], [], []
-            head_hit_rates, head_mean_rank_corr, head_max_rank_corr = [], [], []
             layeridx = 0
             for module in model.modules():
-                if module.__class__.__name__.endswith("AttentionExperimental"):
+                if module.__class__.__name__.endswith("Attention"):
                     try:
                         tok_hit_rates.append(module.tok_hit_acc)
                         # print(f"Layer {layeridx} Token Hit Rate: {100*module.tok_hit_acc}%")
                         tok_mean_rank_corr.append(module.tok_mean_rank_corr)
                         tok_max_rank_corr.append(module.tok_max_rank_corr)
-                        head_hit_rates.append(module.head_hit_acc)
-                        head_mean_rank_corr.append(module.head_mean_rank_corr)
-                        head_max_rank_corr.append(module.head_max_rank_corr)
                         ### Threshold variance investigation
                         if hasattr(module, 'threshmean'):
                             threshold_mean.append(module.threshmean.cpu().detach())
@@ -413,22 +406,14 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
             tok_hit_rates = torch.tensor(tok_hit_rates).mean().item()
             tok_mean_rank_corr = torch.tensor(tok_mean_rank_corr).mean().item()
             tok_max_rank_corr = torch.tensor(tok_max_rank_corr).mean().item()
-            try:
-                head_hit_rates = torch.tensor(head_hit_rates).mean().item()
-                head_mean_rank_corr = torch.tensor(head_mean_rank_corr).mean().item()
-                head_max_rank_corr = torch.tensor(head_max_rank_corr).mean().item()
-            except:
-                head_hit_rates = 0
-                head_mean_rank_corr = 0
-                head_max_rank_corr = 0
+    
             avg_tok_hit_rate.append(tok_hit_rates)
-            avg_head_hit_rate.append(head_hit_rates)
+            
     # Compute perplexity
     avg_loss = total_loss / total_tokens
     perplexity = torch.exp(torch.tensor(avg_loss))
     print(f"Perplexity evaluation completed: {perplexity.item()}")
     print(f"Average Token Hit Rate: {100*sum(avg_tok_hit_rate) / len(avg_tok_hit_rate)}%")
-    print(f"Average Head Hit Rate: {100*sum(avg_head_hit_rate) / len(avg_head_hit_rate)}%")
     model_name = args.model_path.split("/")[-1]
     ### Threshold variance investigation
     if args.calibrate_thresholds:
@@ -468,7 +453,7 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
         print("Stddev Sparsity: ", stddev_sparsity)
 
     for module in model.modules():
-        if module.__class__.__name__.endswith("AttentionExperimental"):
+        if module.__class__.__name__.endswith("Attention"):
             module.calc_hitrates = False
 
     if torch.isnan(perplexity):
@@ -518,11 +503,9 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         The fine-tuned model.
     """
     if args.model_parallelism:
-        model_producer_layers = get_producer_layers(model)
-        for producer_layer in model_producer_layers:
-            if hasattr(producer_layer, "sparse_token_predictor"):
-                for param in producer_layer.sparse_token_predictor.parameters():
-                    param = param.to(producer_layer.q_proj.weight.device)
+        model_producer_layers = model.model.sparse_token_predictors
+        for idx in range(len(model.model.sparse_token_predictors)):
+            model_producer_layers[idx].to(model.model.layers[idx].self_attn.q_proj.weight.device)
         for name, param in model.named_parameters():
             print(f"Layer: {name}, Device: {param.device}")
     max_seq_len = args.train_seqlen
@@ -617,14 +600,9 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
 
     for param in model.parameters():
         param.requires_grad = False
-    producer_layers = get_producer_layers(model)
-    for producer_layer in producer_layers:
-        if hasattr(producer_layer, "sparse_token_predictor"):
-            for param in producer_layer.sparse_token_predictor.parameters():
-                param.requires_grad = True
-            if args.train_headpredictor:
-                for param in producer_layer.sparse_head_predictor.parameters():
-                    param.requires_grad = True
+    producer_layers = model.model.sparse_token_predictors
+    for param in producer_layers.parameters():
+            param.requires_grad = True
     
     print("Set producer layer parameters to require gradients.")
     
@@ -656,18 +634,15 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     grad_norm = 0
     min_wk2 = float('inf')
     observed_task_losses = []
-    observed_head_losses = []
     total_tok_seen = 0
     num_grad_skip = 0
     if args.model_resume_path is not None:
         print(f"Resuming training from checkpoint: {args.model_resume_path}")
         checkpoint = torch.load(args.model_resume_path)
-        model_producer_layer = get_producer_layers(model)
 
         producer_layer_weights = checkpoint['model_state_dict']
-        model_producer_layers = get_producer_layers(model)
-        for idx, producer_layer_weight in enumerate(producer_layer_weights):
-            model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
+        model_producer_layers = model.model.sparse_token_predictors
+        model_producer_layers.load_state_dict(producer_layer_weights, strict=False)
         
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -682,8 +657,8 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         step = 0
         epoch = 0
         
-    avg_headhit, avg_tokhit = 0, 0
-    avg_headhit_corr, avg_tokhit_corr = 0, 0
+    avg_tokhit = 0
+    avg_tokhit_corr = 0
     train_progress = 0
     epoch_loss = 0.0
     running_loss = None
@@ -695,7 +670,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 continue
             calc_hitrates = False
             for module in model.modules():
-                if module.__class__.__name__.endswith("AttentionExperimental"):
+                if module.__class__.__name__.endswith("Attention"):
                     if step % 20 == 0:
                         calc_hitrates = True
                         module.calc_hitrates = calc_hitrates
@@ -711,12 +686,11 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             outputs = model(input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
             task_loss = outputs.loss
             mse_match_loss = 0
-            head_match_loss = 0
             nlayers = 0
-            headhit_accs, tok_hit_accs, headhit_corr, tok_hit_corr = [], [], [], []
+            tok_hit_accs, tok_hit_corr = [], []
 
             for module in model.modules():
-                if module.__class__.__name__.endswith("AttentionExperimental"):
+                if module.__class__.__name__.endswith("Attention"):
                     if hasattr(module, 'msemagn_loss'):
                         nlayers += 1
                         try:
@@ -725,40 +699,28 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                             mse_match_loss += 0
                             # import pdb; pdb.set_trace()
                         module.msemagn_loss = 0
-                        if args.train_headpredictor:
-                            head_match_loss += module.headmsemagn_loss.to('cuda:0')
-                            module.headmsemagn_loss = 0
+                        
                         if calc_hitrates:
-                            headhit_accs.append(module.head_hit_acc)
+                            
                             tok_hit_accs.append(module.tok_hit_acc)
-                            headhit_corr.append(module.head_mean_rank_corr)
+                            
                             tok_hit_corr.append(module.tok_mean_rank_corr)
 
             mse_match_loss = mse_match_loss / nlayers
             observed_task_losses.append(mse_match_loss.item())
-            if args.train_headpredictor:
-                observed_head_losses.append(head_match_loss.item())
-            else:
-                observed_head_losses.append(0)
+            
             if calc_hitrates:
-                avg_headhit = 100 * sum(headhit_accs) / len(headhit_accs)
+                
                 avg_tokhit = 100 * sum(tok_hit_accs) / len(tok_hit_accs)
-                avg_headhit_corr = sum(headhit_corr) / len(headhit_corr)
+                
                 avg_tokhit_corr = sum(tok_hit_corr) / len(tok_hit_corr)
 
-            if args.train_headpredictor:
-                mse_match_loss.backward(retain_graph=True)
-                (100 * head_match_loss).backward()
-            else:
-                mse_match_loss.backward()
+            
+            mse_match_loss.backward()
 
             step += 1
 
-            for producer_layer in producer_layers:
-                if hasattr(producer_layer, "sparse_token_predictor"):
-                    grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_token_predictor.parameters(), max_norm=args.max_norm)
-                    if args.train_headpredictor:
-                        head_grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_head_predictor.parameters(), max_norm=args.max_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.model.sparse_token_predictors.parameters(), max_norm=args.max_norm)
 
             if step % args.save_interval == 0:
                 save_checkpoint(args, model, optimizer, scheduler, step=step, epoch=epoch, note="intermediate")
@@ -784,7 +746,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 if args.do_downstream_eval:
                     if step % ( 4 * eval_freq ) == 0 and step > 10:
                         print("Evaluating on additional tasks...")
-                        task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn, train_headpredictor=args.train_headpredictor)
+                        task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn)
                         if dowandb:
                             for task_name, task_res in task_results.items():
                                 try:
@@ -800,15 +762,11 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 torch.cuda.empty_cache()
                 gc.collect()
             if dowandb:
-                if args.train_headpredictor:
-                    hloss = (100 * head_match_loss).item()
-                else:
-                    hloss = 0
+              
                 tb_writer.add_scalar('MSE_Attn_Loss', mse_match_loss.item(), step)
-                tb_writer.add_scalar('Head_Loss', hloss, step)
-                tb_writer.add_scalar('Head_Hit_Acc', avg_headhit, step)
+                
                 tb_writer.add_scalar('Token_Hit_Acc', avg_tokhit, step)
-                tb_writer.add_scalar('Head_Hit_Corr', avg_headhit_corr, step)
+                
                 tb_writer.add_scalar('Token_Hit_Corr', avg_tokhit_corr, step)
                 tb_writer.add_scalar('task_loss', task_loss.item(), step)
                 tb_writer.add_scalar('MSE_Attn_RunningLoss', running_loss, step)
@@ -834,7 +792,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 gc.collect()
                 import traceback
                 traceback.print_exc()
-                # import pdb; pdb.set_trace()
+                import pdb; pdb.set_trace()
                 continue
     avg_train_loss = epoch_loss / nsamples
     print(f"Average training loss for epoch {epoch+1}: {avg_train_loss:.4f}")
@@ -892,10 +850,8 @@ if __name__ == '__main__':
     parser.add_argument('--softmax_causal_loss_ce', action='store_true', help='Change loss type to softmax causal probability based loss.')
     parser.add_argument('--sliding_window', type=int, default=None, help='Sliding window at eval IF comparing to SnapKV, set it to 16: Very Important!!!!!')
     parser.add_argument('--randomize_init', action='store_true', help='Very Experimental! Tries to train predictor on RANDOMLY initialized transformer...')
-    parser.add_argument('--train_headpredictor', action='store_true', help='Train Head Predictor')
     parser.add_argument('--min_sparse_index', type=int, default=4, help="Num of Sink Tokens")
     parser.add_argument('--attn_reduce_factor', type=int, default=8, help="reduce factor for token predictor attention")
-    parser.add_argument('--head_attn_reduce_factor', type=int, default=2, help="reduce factor for head predictor attention")
     parser.add_argument('--dDash', type=int, default=16, help='Attn Red-dim')
     parser.add_argument('--intdim', type=int, default=512, help='Int-Proc Dim')
 
@@ -937,6 +893,8 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_auth_token=True, use_fast=True, trust_remote_code=True)
     config = AutoConfig.from_pretrained(model_path, use_auth_token=True, trust_remote_code=True)
     
+    from modify_models.modify_llama import LlamaForCausalLM
+
     if args.model_parallelism:
         from transformers import AutoConfig
         device_cnt = torch.cuda.device_count()
@@ -957,18 +915,19 @@ if __name__ == '__main__':
             dtype = torch.float32
         elif dtype == "fp16":
             dtype = torch.float16
-        model = AutoModelForCausalLM.from_pretrained(
+        model = LlamaForCausalLM.from_pretrained(
             model_path,
             device_map=device_map,
             offload_folder=None,
             trust_remote_code=True,
             use_auth_token=True,
             torch_dtype=dtype,
+            attn_implementation="eager"
         )
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_path, offload_folder=None, trust_remote_code=True, use_auth_token=True, **kwargs).cuda()
+        model = LlamaForCausalLM.from_pretrained(model_path, offload_folder=None, trust_remote_code=True, use_auth_token=True, **kwargs).cuda()
     if args.randomize_init:
-        model = AutoModelForCausalLM.from_config(config).cuda()
+        model = LlamaForCausalLM.from_config(config).cuda()
 
     if not hasattr(config, "num_hidden_layers"):
         args.producer_frequency = config.num_layers
@@ -976,76 +935,75 @@ if __name__ == '__main__':
         args.producer_frequency = config.num_hidden_layers
 
 
-    if args.architecture == "llama" and "Yarn-Llama" not in model_path:
-        print("Running module replacement")
-        if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
-            from modify_models.modify_llama import convert_kvcache_experimental
-            from modify_models.modify_llama import LlamaAttentionExperimental
-        else:
-            from modify_models.modify_llama_baselines import convert_kvcache_experimental
-            from modify_models.modify_llama_baselines import LlamaAttentionExperimental
+    # if args.architecture == "llama" and "Yarn-Llama" not in model_path:
+    #     print("Running module replacement")
+    #     if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
+    #         from modify_models.modify_llama import convert_kvcache_experimental
+    #         from modify_models.modify_llama import LlamaAttentionExperimental
+    #     else:
+    #         from modify_models.modify_llama_baselines import convert_kvcache_experimental
+    #         from modify_models.modify_llama_baselines import LlamaAttentionExperimental
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency)
+    #     model = convert_kvcache_experimental(model, config, args.producer_frequency)
 
-    elif args.architecture == "mistral":
-        print("Running Mistral module replacement")
-        if args.eval_llm_mode == "ExpPred":
-            from modify_models.modify_mistral import convert_kvcache_experimental
-        else:
-            from modify_models.modify_mistral_baselines import convert_kvcache_experimental
+    # elif args.architecture == "mistral":
+    #     print("Running Mistral module replacement")
+    #     if args.eval_llm_mode == "ExpPred":
+    #         from modify_models.modify_mistral import convert_kvcache_experimental
+    #     else:
+    #         from modify_models.modify_mistral_baselines import convert_kvcache_experimental
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency)
-    elif args.architecture == "mixtral":
-        print("Running Mixtral module replacement")
-        if args.eval_llm_mode == "ExpPred":
-            from modify_models.modify_mixtral import convert_kvcache_experimental
-        else:
-            raise NotImplementedError("Baseline modes not implemented for Mixtral yet")
+    #     model = convert_kvcache_experimental(model, config, args.producer_frequency)
+    # elif args.architecture == "mixtral":
+    #     print("Running Mixtral module replacement")
+    #     if args.eval_llm_mode == "ExpPred":
+    #         from modify_models.modify_mixtral import convert_kvcache_experimental
+    #     else:
+    #         raise NotImplementedError("Baseline modes not implemented for Mixtral yet")
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency)
-    elif args.architecture == "phi3":
-        print("Running Phi3 module replacement")
-        if args.eval_llm_mode == "ExpPred":
-            from modify_models.modify_phi3 import convert_kvcache_experimental
-        else:
-            from modify_models.modify_phi3_baselines import convert_kvcache_experimental
+    #     model = convert_kvcache_experimental(model, config, args.producer_frequency)
+    # elif args.architecture == "phi3":
+    #     print("Running Phi3 module replacement")
+    #     if args.eval_llm_mode == "ExpPred":
+    #         from modify_models.modify_phi3 import convert_kvcache_experimental
+    #     else:
+    #         from modify_models.modify_phi3_baselines import convert_kvcache_experimental
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency)
-    elif args.architecture == "glm":
-        print("Running GLM module replacement")
-        if args.eval_llm_mode == "ExpPred":
-            from modify_models.modify_glm import convert_kvcache_experimental
-        else:
-            raise NotImplementedError("Baseline modes not implemented for GLM yet")
+    #     model = convert_kvcache_experimental(model, config, args.producer_frequency)
+    # elif args.architecture == "glm":
+    #     print("Running GLM module replacement")
+    #     if args.eval_llm_mode == "ExpPred":
+    #         from modify_models.modify_glm import convert_kvcache_experimental
+    #     else:
+    #         raise NotImplementedError("Baseline modes not implemented for GLM yet")
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency)
-    elif args.architecture == "qwen":
-        print("Running Qwen module replacement")
-        if args.eval_llm_mode == "ExpPred":
-            from modify_models.modify_qwen import convert_kvcache_experimental
-        else:
-            raise NotImplementedError("Baseline modes not implemented for Qwen yet")
+    #     model = convert_kvcache_experimental(model, config, args.producer_frequency)
+    # elif args.architecture == "qwen":
+    #     print("Running Qwen module replacement")
+    #     if args.eval_llm_mode == "ExpPred":
+    #         from modify_models.modify_qwen import convert_kvcache_experimental
+    #     else:
+    #         raise NotImplementedError("Baseline modes not implemented for Qwen yet")
     
-        model = convert_kvcache_experimental(model, config, args.producer_frequency)
-    else:
-        raise NotImplementedError(f"Architecture {args.architecture} not supported")
+    #     model = convert_kvcache_experimental(model, config, args.producer_frequency)
+    # else:
+    #     raise NotImplementedError(f"Architecture {args.architecture} not supported")
 
     token_sparsity_list = []
     for module in model.modules():
-        if module.__class__.__name__.endswith("AttentionExperimental"):
-            module.eval_llm_mode = args.eval_llm_mode
+        if module.__class__.__name__.endswith("LlamaModel"):
             module.token_sparse_method = args.token_sparse_method
             module.set_token_sparsity()
+            module.dDash = args.dDash
+            module.attn_reduce_factor = args.attn_reduce_factor
+            module.intdim = args.intdim
+        if module.__class__.__name__.endswith("Attention"):
+            module.eval_llm_mode = args.eval_llm_mode
             token_sparsity_list.append(1. - module.sparse_aggression)
             module.stream_llm_start_size = args.stream_llm_start_size
             module.num_tok_per_page = args.num_tok_per_page
             module.producer_frequency = args.producer_frequency
-            module.dDash = args.dDash
-            module.attn_reduce_factor = args.attn_reduce_factor
-            module.head_attn_reduce_factor = args.head_attn_reduce_factor
-            module.intdim = args.intdim
             module.flash_attn = args.flash_attn
-            module.train_headpredictor = args.train_headpredictor
             module.late_context_upweight = args.late_context_upweight
             module.softmax_causal_loss_mse = args.softmax_causal_loss_mse
             module.softmax_causal_loss_ce = args.softmax_causal_loss_ce
@@ -1053,10 +1011,10 @@ if __name__ == '__main__':
             module.lookahead = args.lookahead
             module.num_layers_pred = module.producer_frequency
             module.sliding_window = args.sliding_window
+            module.attn_reduce_factor = args.attn_reduce_factor
 
-            if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
-                if module.layer_idx != 31:
-                    module.update_predictor()
+    if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
+        model.model.update_predictor()
 
     if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
         model._prepare_cache_for_generation = patched_prepare_cache_for_generation.__get__(
@@ -1078,68 +1036,57 @@ if __name__ == '__main__':
     if not args.model_parallelism:
         model = model.cuda()
     try:
-        producer_layer = get_producer_layers(model)[0]
 
-        tokpred_params = sum(p.numel() for p in producer_layer.sparse_token_predictor.parameters())
-        if args.train_headpredictor:
-            head_pred_params = sum(p.numel() for p in producer_layer.sparse_head_predictor.parameters())
-        else:
-            head_pred_params = 0
-        total_params = tokpred_params + head_pred_params
+        tokpred_params = sum(p.numel() for p in model.model.sparse_token_predictors.parameters())
+        
+        total_params = tokpred_params
         total_model_params = sum(p.numel() for p in model.parameters())
         spt_perc = tokpred_params / total_model_params * 100
-        hpt_perc = head_pred_params / total_model_params * 100
         print("Total Model Parameters: ", total_model_params)
         print("Token Predictor Param Count: ", tokpred_params)
-        print("Head Predictor Param Count: ", head_pred_params)
         print("Total Predictor Param Count: ", total_params)
         print("Percentage Of Model Params in Token Predictor: ", spt_perc)
-        print("Percentage Of Model Params in Head Predictor: ", hpt_perc)
 
         if dowandb:
             tb_writer.add_scalar('TokenPredictorParam', tokpred_params, 0)
-            tb_writer.add_scalar('HeadPredictorParam', head_pred_params, 0)
             tb_writer.add_scalar('TotalParamCount', total_params, 0)
         print("="*10 + " Token Predictor " + "="*10)
         pprint.pprint({name: {'params': sum(p.numel() for p in module.parameters()), 
                     'percentage': sum(p.numel() for p in module.parameters()) / total_params * 100} 
-            for name, module in producer_layer.sparse_token_predictor.named_modules()})
-        print("="*10 + "Head Predictor" + "="*10)
-        if args.train_headpredictor:
-            pprint.pprint({name: {'params': sum(p.numel() for p in module.parameters()), 
-                        'percentage': sum(p.numel() for p in module.parameters()) / total_params * 100} 
-                for name, module in producer_layer.sparse_head_predictor.named_modules()})
-        else:
-            print("No Head Predictor")
+            for name, module in model.model.sparse_token_predictors.named_modules()})
 
         targetfile = "paramratios.csv"
         if not os.path.exists(targetfile):
             with open(targetfile, mode='w') as file:
                 writer = csv.writer(file)
-                writer.writerow(["wname", "tokpred_params", "head_pred_params", "total_params", "total_model_params", "spt_perc", "hpt_perc"])
-                writer.writerow([args.wname, tokpred_params, head_pred_params, total_params, total_model_params, spt_perc, hpt_perc])
+                writer.writerow(["wname", "tokpred_params", "total_params", "total_model_params", "spt_perc"])
+                writer.writerow([args.wname, tokpred_params, total_params, total_model_params, spt_perc])
         else:
             with open(targetfile, mode='a') as file:
                 writer = csv.writer(file)
-                writer.writerow([args.wname, tokpred_params, head_pred_params, total_params, total_model_params, spt_perc, hpt_perc])
+                writer.writerow([args.wname, tokpred_params, total_params, total_model_params, spt_perc])
     except:
         pass
 
     result_save_folder = "csvresults" if args.model_mode == "finetune" else "evalresults"
     if args.model_mode == "eval":
         if args.model_load_path is not None and args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
-            model_producer_layers = get_producer_layers(model)
+            model_producer_layers = model.model.sparse_token_predictors
             producer_layer_weights = torch.load(args.model_load_path)
-            for idx, producer_layer_weight in enumerate(producer_layer_weights):
-                try:
-                    model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
-                    if args.model_parallelism:
-                        model_producer_layers[idx].to(model.model.layers[idx].self_attn.q_proj.weight.device)
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    print(f"Error loading producer layer {idx}: {e}")
-                    print("\n\nContinuing... !! Bad Perf If Unintentional !!\n\n")
+            model_producer_layers.load_state_dict(producer_layer_weights, strict=False)
+            if args.model_parallelism:
+                for idx in range(len(model.model.sparse_token_predictors)):
+                    model_producer_layers[idx].to(model.model.layers[idx].self_attn.q_proj.weight.device)
+            # for idx, producer_layer_weight in enumerate(producer_layer_weights):
+            #     try:
+            #         model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
+            #         if args.model_parallelism:
+            #             model_producer_layers[idx].to(model.model.layers[idx].self_attn.q_proj.weight.device)
+            #     except Exception as e:
+            #         import traceback
+            #         traceback.print_exc()
+            #         print(f"Error loading producer layer {idx}: {e}")
+            #         print("\n\nContinuing... !! Bad Perf If Unintentional !!\n\n")
             
         set_inference_mode(model, True)
 
@@ -1152,7 +1099,7 @@ if __name__ == '__main__':
             print(f"Perplexity on Wikitext-2: {perplexity:.2f}")
         if args.do_downstream_eval:
             print("Evaluating on additional tasks...")
-            task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn, train_headpredictor=args.train_headpredictor)
+            task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn)
         else:
             task_results = {}
         
@@ -1171,7 +1118,7 @@ if __name__ == '__main__':
 
         effective_sparsities = []
         for module in model.modules():
-            if module.__class__.__name__.endswith("AttentionExperimental"):
+            if module.__class__.__name__.endswith("Attention"):
                 if module.effective_sparsity is not None:
                     effective_sparsities.append(module.effective_sparsity)
         
@@ -1224,7 +1171,7 @@ if __name__ == '__main__':
 
         effective_sparsities = []
         for module in model.modules():
-            if module.__class__.__name__.endswith("AttentionExperimental"):
+            if module.__class__.__name__.endswith("Attention"):
                 if module.effective_sparsity is not None:
                     effective_sparsities.append(module.effective_sparsity)
         
@@ -1245,7 +1192,7 @@ if __name__ == '__main__':
                 print(f"Dataset: {dataset}, Score: {longbench_scores[dataset]}")
         if args.do_downstream_eval:
             print("Evaluating on additional tasks...")
-            task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn, train_headpredictor=args.train_headpredictor)
+            task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn)
             print(f"Task evaluation results: {json.dumps(task_results, indent=4)}")
         else:
             task_results = {}

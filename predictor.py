@@ -337,6 +337,7 @@ class TokenImportancePredictorAttentive(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(offset, offset + L, dtype=torch.long, device=self.device)
             position_ids = position_ids.unsqueeze(0).expand(B, L)
+        position_ids = position_ids.to(self.device)
 
         cos, sin = self.rotary_emb_attn(k_importance, position_ids)
         q_importance, k_importance = apply_rotary_pos_emb(q_importance, k_importance, cos, sin, position_ids)
