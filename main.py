@@ -618,7 +618,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
 
     print("Inference mode: False")
     batch_item = next(iter(data_loader))
-    nsamples = len(data_loader)
+    nsamples = len(data_loader) * args.epoch_num
     total_steps = nsamples
     print("\n\n Total Steps: ", total_steps, "\n\n")
     
@@ -660,142 +660,151 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     avg_tokhit = 0
     avg_tokhit_corr = 0
     train_progress = 0
-    epoch_loss = 0.0
     running_loss = None
-    progress_bar = tqdm.tqdm(data_loader, desc="Training...", initial=step % len(data_loader), total=len(data_loader))
-    for batch_idx, batch in enumerate(progress_bar):
-        train_progress += 1
-        try:
-            if batch_idx < step:
-                continue
-            calc_hitrates = False
-            for module in model.modules():
-                if module.__class__.__name__.endswith("Attention"):
-                    if step % 20 == 0:
-                        calc_hitrates = True
-                        module.calc_hitrates = calc_hitrates
-                    else:
-                        calc_hitrates = False
-                        module.calc_hitrates = False
+    
+    for epoch_idx in range(args.epoch_num):
 
-            input_ids = batch.to(model.device)
-            input_ids = input_ids[:, :max_seq_len]
-            total_tok_seen += input_ids.size(1) * input_ids.size(0)  # L * B
-            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(model.device)
-            labels = input_ids.clone()
-            outputs = model(input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
-            task_loss = outputs.loss
-            mse_match_loss = 0
-            nlayers = 0
-            tok_hit_accs, tok_hit_corr = [], []
+        epoch_loss = 0.0
 
-            for module in model.modules():
-                if module.__class__.__name__.endswith("Attention"):
-                    if hasattr(module, 'msemagn_loss'):
-                        nlayers += 1
-                        try:
-                            mse_match_loss += module.msemagn_loss.to('cuda:0')
-                        except:
-                            mse_match_loss += 0
-                            # import pdb; pdb.set_trace()
-                        module.msemagn_loss = 0
-                        
-                        if calc_hitrates:
+        progress_bar = tqdm.tqdm(data_loader, desc="Training...", initial=step % len(data_loader), total=len(data_loader))
+
+        for batch_idx, batch in enumerate(progress_bar):
+            train_progress += 1
+            try:
+                if batch_idx + epoch * len(data_loader) < step:
+                    continue
+                calc_hitrates = False
+                for module in model.modules():
+                    if module.__class__.__name__.endswith("Attention"):
+                        if step % 20 == 0:
+                            calc_hitrates = True
+                            module.calc_hitrates = calc_hitrates
+                        else:
+                            calc_hitrates = False
+                            module.calc_hitrates = False
+
+                input_ids = batch.to(model.device)
+                input_ids = input_ids[:, :max_seq_len]
+                total_tok_seen += input_ids.size(1) * input_ids.size(0)  # L * B
+                attention_mask = (input_ids != tokenizer.pad_token_id).long().to(model.device)
+                labels = input_ids.clone()
+                outputs = model(input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
+                task_loss = outputs.loss
+                mse_match_loss = 0
+                comp_all_layers = 0
+                nlayers = 0
+                tok_hit_accs, tok_hit_corr = [], []
+
+                for module in model.modules():
+                    if module.__class__.__name__.endswith("Attention"):
+                        if hasattr(module, 'msemagn_loss'):
+                            nlayers += 1
+                            try:
+                                mse_match_loss += module.msemagn_loss.to('cuda:0')
+                            except:
+                                mse_match_loss += 0
+                                # import pdb; pdb.set_trace()
+                            module.msemagn_loss = 0
                             
-                            tok_hit_accs.append(module.tok_hit_acc)
-                            
-                            tok_hit_corr.append(module.tok_mean_rank_corr)
+                            if calc_hitrates:
+                                
+                                tok_hit_accs.append(module.tok_hit_acc)
+                                
+                                tok_hit_corr.append(module.tok_mean_rank_corr)
 
-            mse_match_loss = mse_match_loss / nlayers
-            observed_task_losses.append(mse_match_loss.item())
-            
-            if calc_hitrates:
+                mse_match_loss = mse_match_loss / nlayers
+                observed_task_losses.append(mse_match_loss.item())
                 
-                avg_tokhit = 100 * sum(tok_hit_accs) / len(tok_hit_accs)
+                if calc_hitrates:
+                    
+                    avg_tokhit = 100 * sum(tok_hit_accs) / len(tok_hit_accs)
+                    
+                    avg_tokhit_corr = sum(tok_hit_corr) / len(tok_hit_corr)
+
                 
-                avg_tokhit_corr = sum(tok_hit_corr) / len(tok_hit_corr)
+                mse_match_loss.backward()
 
-            
-            mse_match_loss.backward()
+                step += 1
 
-            step += 1
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.model.sparse_token_predictors.parameters(), max_norm=args.max_norm)
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.model.sparse_token_predictors.parameters(), max_norm=args.max_norm)
+                if step % args.save_interval == 0:
+                    save_checkpoint(args, model, optimizer, scheduler, step=step, epoch=epoch, note="intermediate")
 
-            if step % args.save_interval == 0:
-                save_checkpoint(args, model, optimizer, scheduler, step=step, epoch=epoch, note="intermediate")
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
 
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-
-            epoch_loss += mse_match_loss.item()
-            if running_loss is None:
-                running_loss = mse_match_loss.item()
-            else:
-                running_loss = (running_loss * step + mse_match_loss.item()) / (step + 1)
-            progress_bar.set_description(f"Training... (Running Loss: {running_loss:.4e})")
-            torch.cuda.empty_cache()
-            gc.collect()
-            if step % eval_freq == 0:
-                print("Subset-eval here.")
-                set_inference_mode(model, True)
-                eval_pplx, _ = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=True, config=config)
+                epoch_loss += mse_match_loss.item()
+                if running_loss is None:
+                    running_loss = mse_match_loss.item()
+                else:
+                    running_loss = (running_loss * step + mse_match_loss.item()) / (step + 1)
+                progress_bar.set_description(f"Training... (Running Loss: {running_loss:.4e}, Epoch: {epoch+1})")
+                torch.cuda.empty_cache()
+                gc.collect()
+                if step % eval_freq == 0:
+                    print("Subset-eval here.")
+                    set_inference_mode(model, True)
+                    eval_pplx, _ = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=True, config=config)
+                    if dowandb:
+                        tb_writer.add_scalar('traintime_pplx', eval_pplx, step)
+                    if args.do_downstream_eval:
+                        if step % ( 4 * eval_freq ) == 0 and step > 10:
+                            print("Evaluating on additional tasks...")
+                            task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn)
+                            if dowandb:
+                                for task_name, task_res in task_results.items():
+                                    try:
+                                        tb_writer.add_scalar(f"{task_name}", task_res['acc,none'], step)
+                                    except KeyError:
+                                        pass
+                    if eval_pplx < min_wk2:
+                        min_wk2 = eval_pplx
+                        print(f"New best model found with perplexity: {min_wk2:.4f}")
+                        save_model(args, model, note="_best")
+                    set_inference_mode(model, False)
+                    model.train()
+                    torch.cuda.empty_cache()
+                    gc.collect()
                 if dowandb:
-                    tb_writer.add_scalar('traintime_pplx', eval_pplx, step)
-                if args.do_downstream_eval:
-                    if step % ( 4 * eval_freq ) == 0 and step > 10:
-                        print("Evaluating on additional tasks...")
-                        task_results = run_lm_eval_zero_shot(model, tokenizer, task_list=args.task_list, limit=args.eval_subset, flash_attn=args.flash_attn)
-                        if dowandb:
-                            for task_name, task_res in task_results.items():
-                                try:
-                                    tb_writer.add_scalar(f"{task_name}", task_res['acc,none'], step)
-                                except KeyError:
-                                    pass
-                if eval_pplx < min_wk2:
-                    min_wk2 = eval_pplx
-                    print(f"New best model found with perplexity: {min_wk2:.4f}")
-                    save_model(args, model, note="_best")
-                set_inference_mode(model, False)
-                model.train()
-                torch.cuda.empty_cache()
-                gc.collect()
-            if dowandb:
-              
-                tb_writer.add_scalar('MSE_Attn_Loss', mse_match_loss.item(), step)
                 
-                tb_writer.add_scalar('Token_Hit_Acc', avg_tokhit, step)
-                
-                tb_writer.add_scalar('Token_Hit_Corr', avg_tokhit_corr, step)
-                tb_writer.add_scalar('task_loss', task_loss.item(), step)
-                tb_writer.add_scalar('MSE_Attn_RunningLoss', running_loss, step)
-                tb_writer.add_scalar('grad_norm', grad_norm.item(), step)
-                tb_writer.add_scalar('learning_rate', scheduler.get_last_lr()[0], step)
-                tb_writer.add_scalar('total_tokens', total_tok_seen, step)
-                tb_writer.add_scalar('stepskip', 1, step)
-                tb_writer.add_scalar('TrainProgress', float(train_progress / len(data_loader)), step)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"An error occurred: {e}")
-
-        except Exception as e:
-            if "ScaledDotProductEfficientAttentionBackward0" in str(e):
-                print(f"RuntimeError encountered: {e}. Skipping this iteration.")
-                torch.cuda.empty_cache()
-                gc.collect()
-                continue  # Skip this batch
-            else:
-                print(f"Interesing error: {e}")
-                torch.cuda.empty_cache()
-                gc.collect()
+                    tb_writer.add_scalar('MSE_Attn_Loss', mse_match_loss.item(), step)
+                    
+                    tb_writer.add_scalar('Token_Hit_Acc', avg_tokhit, step)
+                    
+                    tb_writer.add_scalar('Token_Hit_Corr', avg_tokhit_corr, step)
+                    tb_writer.add_scalar('task_loss', task_loss.item(), step)
+                    tb_writer.add_scalar('MSE_Attn_RunningLoss', running_loss, step)
+                    tb_writer.add_scalar('grad_norm', grad_norm.item(), step)
+                    tb_writer.add_scalar('learning_rate', scheduler.get_last_lr()[0], step)
+                    tb_writer.add_scalar('total_tokens', total_tok_seen, step)
+                    tb_writer.add_scalar('stepskip', 1, step)
+                    tb_writer.add_scalar('TrainProgress', float(train_progress / len(data_loader)), step)
+            except Exception as e:
                 import traceback
                 traceback.print_exc()
-                import pdb; pdb.set_trace()
-                continue
-    avg_train_loss = epoch_loss / nsamples
-    print(f"Average training loss for epoch {epoch+1}: {avg_train_loss:.4f}")
+                print(f"An error occurred: {e}")
+
+            except Exception as e:
+                if "ScaledDotProductEfficientAttentionBackward0" in str(e):
+                    print(f"RuntimeError encountered: {e}. Skipping this iteration.")
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    continue  # Skip this batch
+                else:
+                    print(f"Interesing error: {e}")
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    import traceback
+                    traceback.print_exc()
+                    import pdb; pdb.set_trace()
+                    continue
+        avg_train_loss = epoch_loss / nsamples
+        print(f"Average training loss for epoch {epoch+1}: {avg_train_loss:.4f}")
+
+        epoch += 1
+
     return model, mask_array
 
 
@@ -826,6 +835,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_norm', type=int, default=20, help='Max Norm')
     parser.add_argument('--pred_lr', type=float, default=1e-3, help='Predictor learning rate')
     parser.add_argument('--train_dtype', type=str, default="fp32", help="dtype for training")
+    parser.add_argument('--epoch_num', type=int, default=1, help="epoch for training")
 
     # Evaluation Related Arguments
     parser.add_argument('--eval_dtype', type=str, default="fp16", help="dtype for training")
@@ -854,6 +864,7 @@ if __name__ == '__main__':
     parser.add_argument('--attn_reduce_factor', type=int, default=8, help="reduce factor for token predictor attention")
     parser.add_argument('--dDash', type=int, default=16, help='Attn Red-dim')
     parser.add_argument('--intdim', type=int, default=512, help='Int-Proc Dim')
+    parser.add_argument('--CR', type=float, default=2, help='Int-Proc Dim')
 
     # Model-Mode (Config, Calibrate) related arguments
     parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
