@@ -36,11 +36,11 @@
 # bash eval_scan.sh L3_8B_1k.csv L3_8B_1k snapkv meta-llama/Llama-3.1-8B 1024 32 <PATH_TO_CHECKPOINT>
 
 #### Llama 2 7B
-# bash eval_scan.sh L2_7B_2k.csv L2_7B_2k ExpPred meta-llama/Llama-2-7b-hf 1024 32 <PATH_TO_CHECKPOINT>
-# bash eval_scan.sh L2_7B_2k.csv L2_7B_2k oracle meta-llama/Llama-2-7b-hf 1024 32 <PATH_TO_CHECKPOINT>
-# bash eval_scan.sh L2_7B_2k.csv L2_7B_2k h2o_true meta-llama/Llama-2-7b-hf 1024 32 <PATH_TO_CHECKPOINT>
-# bash eval_scan.sh L2_7B_2k.csv L2_7B_2k quest meta-llama/Llama-2-7b-hf 1024 32 <PATH_TO_CHECKPOINT>
-# bash eval_scan.sh L2_7B_2k.csv L2_7B_2k snapkv meta-llama/Llama-2-7b-hf 1024 32 <PATH_TO_CHECKPOINT>
+# bash ./scripts/eval_scan.sh L2_7B_2k.csv L2_7B_2k ExpPred /home/yangx/Llama-2-7b-chat-hf 1024 32 /home/yangx/TokenButler/expt_model/TrainTokenButler_42_finetune_None_None_500_llama__home_yangx_Llama-2-7b-chat-hf_L2_7B_2k.csv_L2_7B_2k_True_False_5_False_c4_realnewslike_1024_1_4000_20_0.001_fp32_fp16_1024/16_False_4_1000_ExpPred_fixed_40pc_True_False_0_False_False_True_None_False_4_4_16_512_False_False_True_32_0.3875000000000002_20250414-073430.pt
+# bash ./scripts/eval_scan.sh L2_7B_2k.csv L2_7B_2k oracle /home/yangx/Llama-2-7b-chat-hf 1024 32 /home/yangx/TokenButler/expt_model/TrainTokenButler_42_finetune_None_None_500_llama__home_yangx_Llama-2-7b-chat-hf_L2_7B_2k.csv_L2_7B_2k_True_False_2000_False_c4_realnewslike_1024_1_4_20_0.001_1024_16_False/4_1000_ExpPred_fixed_40pc_True_False_0_False_False_True_None_False_False_4_8_2_32_1024_False_False_True_32_0.3875000000000002_20250322-015404.pt
+# bash ./scripts/eval_scan.sh L2_7B_2k.csv L2_7B_2k h2o_true /home/yangx/Llama-2-7b-chat-hf 1024 32 /home/yangx/TokenButler/expt_model/TrainTokenButler_42_finetune_None_None_500_llama__home_yangx_Llama-2-7b-chat-hf_L2_7B_2k.csv_L2_7B_2k_True_False_2000_False_c4_realnewslike_1024_1_4_20_0.001_1024_16_False/4_1000_ExpPred_fixed_40pc_True_False_0_False_False_True_None_False_False_4_8_2_32_1024_False_False_True_32_0.3875000000000002_20250322-015404.pt
+# bash ./scripts/eval_scan.sh L2_7B_2k.csv L2_7B_2k quest /home/yangx/Llama-2-7b-chat-hf 1024 32 /home/yangx/TokenButler/expt_model/TrainTokenButler_42_finetune_None_None_500_llama__home_yangx_Llama-2-7b-chat-hf_L2_7B_2k.csv_L2_7B_2k_True_False_2000_False_c4_realnewslike_1024_1_4_20_0.001_1024_16_False/4_1000_ExpPred_fixed_40pc_True_False_0_False_False_True_None_False_False_4_8_2_32_1024_False_False_True_32_0.3875000000000002_20250322-015404.pt
+# bash ./scripts/eval_scan.sh L2_7B_2k.csv L2_7B_2k snapkv /home/yangx/Llama-2-7b-chat-hf 1024 32 /home/yangx/TokenButler/expt_model/TrainTokenButler_42_finetune_None_None_500_llama__home_yangx_Llama-2-7b-chat-hf_L2_7B_2k.csv_L2_7B_2k_True_False_2000_False_c4_realnewslike_1024_1_4_20_0.001_1024_16_False/4_1000_ExpPred_fixed_40pc_True_False_0_False_False_True_None_False_False_4_8_2_32_1024_False_False_True_32_0.3875000000000002_20250322-015404.pt
 
 #### Mistral7B
 # bash eval_scan.sh M7B_1k.csv M7B_1k ExpPred mistralai/Mistral-7B-v0.1 1024 32 <PATH_TO_CHECKPOINT>
@@ -100,7 +100,6 @@ for perc in {10..60..10}; do
         --train_subset_fac 4 \
         --train_seqlen 1024 \
         --eval_llm_mode ${eval_llm_mode} \
-        --lfunc MSE \
         --result_file ${result_file} \
         --wname ${wname} \
         --pred_lr 1e-3 \
@@ -109,6 +108,7 @@ for perc in {10..60..10}; do
         --intdim ${intdim} \
         --task_list '${task_list}' \
         --eval_subset ${eval_subset} \
+        --attn_reduce_factor 4 \
         --eval_wk2_seqlen 1024 --num_tok_per_page 4" \
         
 
